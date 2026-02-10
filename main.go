@@ -1,250 +1,281 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Application states
-type appState int
+type Todo struct {
+	Title string `json:"title"`
+	Done  bool   `json:"done"`
+}
 
-const (
-	browsing appState = iota
-	inputting
-	helping
-)
+type model struct {
+	todos       []Todo
+	cursor      int
+	input       textinput.Model
+	adding      bool
+	quitting    bool
+	compactMode bool
+	err         error
+	width       int
+	height      int
+}
 
-// Styles using Lip Gloss for a minimalist aesthetic
+// Styling
 var (
-	// Selected item style: bold with a subtle accent color
-	selectedStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("212")).
-			Bold(true).
-			PaddingLeft(2)
+	// Compact Mode Styles (Raw)
+	cursorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 
-	// Unselected items: dimmed for visual hierarchy
-	normalStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("245")).
-			PaddingLeft(4)
+	// Full Mode Styles
+	appStyle = lipgloss.NewStyle().
+			Padding(1, 2).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62"))
 
-	// Cursor indicator for selected item
-	cursorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("212")).
+	titleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("230")).
+			Background(lipgloss.Color("62")).
+			Padding(0, 1).
 			Bold(true)
 
-	// Title style
-	titleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("99")).
-			Bold(true).
-			MarginBottom(1)
-
-	// Help text style
-	helpStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("241")).
-			MarginTop(1)
-
-	// Input prompt style
-	inputPromptStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("212")).
-				Bold(true).
-				MarginTop(1)
+	listHeaderStyle = lipgloss.NewStyle().
+			MarginLeft(2)
 )
 
-// Model holds the application state following the Elm architecture
-type model struct {
-	tasks    []string          // List of tasks
-	cursor   int               // Currently selected task index
-	state    appState          // Current application state (browsing or inputting)
-	input    textinput.Model   // Text input component for adding tasks
-	quitting bool              // Flag to indicate app is quitting
+func getTodoPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	todoDir := filepath.Join(configDir, "todotui")
+	// Ensure directory exists
+	if err := os.MkdirAll(todoDir, 0755); err != nil {
+		return "", err
+	}
+	return filepath.Join(todoDir, "todos.json"), nil
 }
 
-// initialModel creates and returns the initial model state
+func loadTodos() []Todo {
+	var todos []Todo
+
+	path, err := getTodoPath()
+	if err != nil {
+		return []Todo{}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []Todo{}
+		}
+		return []Todo{}
+	}
+	if err := json.Unmarshal(data, &todos); err != nil {
+		return []Todo{}
+	}
+	return todos
+}
+
+func saveTodos(todos []Todo) {
+	path, err := getTodoPath()
+	if err != nil {
+		return
+	}
+
+	data, err := json.MarshalIndent(todos, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0644)
+}
+
 func initialModel() model {
+	todos := loadTodos()
 	ti := textinput.New()
-	ti.Placeholder = "Enter task name..."
-	ti.CharLimit = 100
-	ti.Width = 40
+	ti.Placeholder = "Task name..."
+	ti.Focus()
+	ti.Prompt = ""
 
 	return model{
-		tasks:  []string{},
-		cursor: 0,
-		state:  browsing,
-		input:  ti,
+		todos:       todos,
+		cursor:      0,
+		input:       ti,
+		adding:      false,
+		compactMode: false, // Default to Full Mode
 	}
 }
 
-// Init implements tea.Model - called once when the program starts
 func (m model) Init() tea.Cmd {
-	return nil
+	return tea.EnterAltScreen
 }
 
-// Update implements tea.Model - handles all messages and user input
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		// Handle key presses based on current state
-		switch m.state {
-		case browsing:
-			return m.updateBrowsing(msg)
-		case inputting:
-			return m.updateInputting(msg)
-		case helping:
-			return m.updateHelping(msg)
-		}
-	}
-	return m, nil
-}
-
-// updateBrowsing handles key input when in browse mode
-func (m model) updateBrowsing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	// Quit commands
-	case "q", "esc", "ctrl+c":
-		m.quitting = true
+	if m.quitting {
 		return m, tea.Quit
+	}
 
-	// Navigation: move up
-	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
-		}
+	var cmd tea.Cmd
 
-	// Navigation: move down
-	case "down", "j":
-		if m.cursor < len(m.tasks)-1 {
-			m.cursor++
-		}
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
 
-	// Add new task: switch to input mode
-	case "n", "a":
-		m.state = inputting
-		m.input.Focus()
-		return m, textinput.Blink
-
-	// Toggle help
-	case "?", "h":
-		m.state = helping
-
-	// Delete/Complete task
-	case "x", "backspace", "d":
-		if len(m.tasks) > 0 {
-			// Remove the selected task
-			m.tasks = append(m.tasks[:m.cursor], m.tasks[m.cursor+1:]...)
-			// Adjust cursor if needed
-			if m.cursor >= len(m.tasks) && m.cursor > 0 {
-				m.cursor--
+	case tea.KeyMsg:
+		if m.adding {
+			switch msg.Type {
+			case tea.KeyEnter:
+				if m.input.Value() != "" {
+					m.todos = append(m.todos, Todo{Title: m.input.Value(), Done: false})
+					saveTodos(m.todos)
+					m.input.Reset()
+					m.adding = false
+					m.cursor = len(m.todos) - 1
+				} else {
+					m.adding = false
+				}
+				return m, nil
+			case tea.KeyEsc:
+				m.adding = false
+				m.input.Reset()
+				return m, nil
+			}
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+		} else {
+			// Navigation Mode
+			switch msg.String() {
+			case "q", "ctrl+c":
+				m.quitting = true
+				return m, tea.Quit
+			case "tab":
+				m.compactMode = !m.compactMode
+				if m.compactMode {
+					return m, tea.ExitAltScreen
+				}
+				return m, tea.EnterAltScreen
+			case "up", "k":
+				if m.cursor > 0 {
+					m.cursor--
+				}
+			case "down", "j":
+				if m.cursor < len(m.todos)-1 {
+					m.cursor++
+				}
+			case "n":
+				m.adding = true
+				m.input.Focus()
+				return m, textinput.Blink
+			case "x":
+				if len(m.todos) > 0 {
+					m.todos = append(m.todos[:m.cursor], m.todos[m.cursor+1:]...)
+					if m.cursor >= len(m.todos) && m.cursor > 0 {
+						m.cursor--
+					}
+					saveTodos(m.todos)
+				}
+			case "space", "enter":
+				// Optional: Toggle Done
+				// if len(m.todos) > 0 {
+				// 	m.todos[m.cursor].Done = !m.todos[m.cursor].Done
+				// 	saveTodos(m.todos)
+				// }
 			}
 		}
 	}
-	return m, nil
-}
-
-// updateHelping handles key input when in help mode
-func (m model) updateHelping(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc", "q", "?", "h", "enter":
-		m.state = browsing
-	}
-	return m, nil
-}
-
-// updateInputting handles key input when in input mode
-func (m model) updateInputting(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	var cmd tea.Cmd
-
-	switch msg.String() {
-	// Cancel input and return to browse mode
-	case "esc":
-		m.state = browsing
-		m.input.Reset()
-		return m, nil
-
-	// Submit the new task
-	case "enter":
-		value := m.input.Value()
-		if value != "" {
-			m.tasks = append(m.tasks, value)
-			m.cursor = len(m.tasks) - 1 // Move cursor to new task
-		}
-		m.state = browsing
-		m.input.Reset()
-		return m, nil
-	}
-
-	// Update the text input component
-	m.input, cmd = m.input.Update(msg)
 	return m, cmd
 }
 
-// View implements tea.Model - renders the UI
 func (m model) View() string {
 	if m.quitting {
-		return "Goodbye! ✨\n"
+		return ""
 	}
 
-	var s string
+	var s strings.Builder
 
-	// Title
-	s += titleStyle.Render("📝 To-Do") + "\n\n"
-
-	// Render task list
-	if len(m.tasks) == 0 {
-		s += normalStyle.Render("No tasks yet. Press 'n' to add one.") + "\n"
-	} else {
-		for i, task := range m.tasks {
-			if i == m.cursor {
-				// Selected item with cursor indicator
-				s += cursorStyle.Render("→ ") + selectedStyle.Render(task) + "\n"
+	// Render Todo List Content
+	var listContent strings.Builder
+	for i, t := range m.todos {
+		cursor := "  "
+		if m.cursor == i && !m.adding {
+			cursor = "> "
+			if m.compactMode {
+				cursor = cursorStyle.Render(cursor)
 			} else {
-				// Unselected items
-				s += normalStyle.Render(task) + "\n"
+				// In Full Mode, we can use a different indicator or keeping it simple
+				cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("> ")
+			}
+		}
+
+		title := t.Title
+		if m.cursor == i && !m.adding {
+			if m.compactMode {
+				title = selectedStyle.Render(title)
+			} else {
+				title = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(title)
+			}
+		}
+
+		fmt.Fprintf(&listContent, "%s%s\n", cursor, title)
+	}
+
+	// Render Input or Footer
+	var footerContent string
+	if m.adding {
+		footerContent = fmt.Sprintf("  %s", m.input.View())
+	} else {
+		if len(m.todos) == 0 {
+			footerContent = "No tasks. Press 'n' to add."
+		} else {
+			if !m.compactMode {
+				footerContent = "\nPress 'n' to add • 'x' to delete • 'q' to quit • 'Tab' to toggle view"
 			}
 		}
 	}
 
-	// Render input field when in input mode
-	if m.state == inputting {
-		s += "\n" + inputPromptStyle.Render("New Task:") + "\n"
-		s += "  " + m.input.View() + "\n"
+	if m.compactMode {
+		// Compact Mode: Raw rendering
+		s.WriteString(listContent.String())
+		s.WriteString(footerContent)
+		if !m.adding && len(m.todos) > 0 {
+			// Add a little hint about tab in compact mode if you want, but sticking to "raw"
+		}
+		s.WriteString("\n") // Ensure newline at end
+		return s.String()
 	}
 
-	// Render help text or help view
-	s += "\n"
-	if m.state == browsing {
-		s += helpStyle.Render("↑/↓: navigate • n: add • x: delete • ?: help • q: quit")
-	} else if m.state == inputting {
-		s += helpStyle.Render("enter: save • esc: cancel")
-	} else if m.state == helping {
-		s = titleStyle.Render("📖 Help & Commands") + "\n\n"
-		s += lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("Navigation:") + "\n"
-		s += normalStyle.Render("↑ / k      - Move selection up") + "\n"
-		s += normalStyle.Render("↓ / j      - Move selection down") + "\n\n"
+	// Full Mode: Styled Container
+	// Build the main view
+	mainView := listContent.String() + "\n" + footerContent
 
-		s += lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("Tasks:") + "\n"
-		s += normalStyle.Render("n / a      - Add a new task (New/Add)") + "\n"
-		s += normalStyle.Render("x / d / bk - Remove selected task (Delete)") + "\n"
-		s += normalStyle.Render("Enter      - Confirm new task (In input mode)") + "\n\n"
+	// Create a window-like feel
+	// Calculate dynamic height/width if needed, or just let lipgloss handle it
 
-		s += lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("Application:") + "\n"
-		s += normalStyle.Render("? / h      - Toggle this help view") + "\n"
-		s += normalStyle.Render("q / Esc    - Return to list or Quit") + "\n"
-		s += normalStyle.Render("Ctrl+C     - Force quit") + "\n\n"
+	window := appStyle.Render(
+		lipgloss.JoinVertical(lipgloss.Left,
+			titleStyle.Render("My Tasks"),
+			"\n",
+			mainView,
+		),
+	)
 
-		s += helpStyle.Render("Press any key to return...")
-	}
-
-	return s + "\n"
+	// Center the window in the available space
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, window)
 }
 
 func main() {
-	p := tea.NewProgram(initialModel())
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error running program: %v\n", err)
+		fmt.Printf("Error: %v", err)
 		os.Exit(1)
 	}
 }
