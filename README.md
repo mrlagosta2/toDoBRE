@@ -1,45 +1,95 @@
-# 📝 To-Do TUI
+# 📝 MAU-toDoTUI
 
-A minimalist, clean Terminal User Interface for managing tasks, built with Go and Bubble Tea.
+A minimalist yet powerful Terminal User Interface (TUI) for managing tasks, built with **Go**, **Bubble Tea**, and **Lip Gloss**.
 
-## 🚀 How to Start
+![MAU-toDoTUI](https://charm.sh/img/bubbletea.png)
+*(Note: Replace with actual screenshot if available)*
 
-### Option 1: Run the pre-compiled executable (Recommended)
-You can run the app immediately without needing Go in your PATH:
-```powershell
-.\todotui.exe
-```
+## ✨ Features
 
-### Option 2: Run from source
-If you want to run via Go:
-```powershell
-& "C:\Program Files\Go\bin\go.exe" run .
+- **📂 Group Management**: Organize tasks into custom groups (Work, Personal, etc.).
+- **🌐 "All" Aggregation**: The default "All" group (Index 0) shows every task from every group in one timeline.
+- **🎨 Dynamic Theming**:
+    - Over 20+ distinct pastel and neon colors for groups.
+    - Borders and highlights dynamically match the active group's color.
+    - The "All" view is neutrally styled (Light Gray) for distinction.
+- **⚡ Smart Sorting**: Active tasks float to the top; Completed tasks sink to the bottom (dimmed).
+- **📝 Full CRUD**:
+    - **Create**: Add new Groups or Tasks instantly.
+    - **Read**: Filter by group or view all.
+    - **Update**: **Rename** groups and tasks in place with context-aware logic.
+    - **Delete**: Safe deletion with confirmation for non-empty groups.
+- **👁️ View Modes**: Toggle between **Full Mode** (Bordered Window) and **Compact Mode** (Inline) using `Tab`.
+
+---
+
+## 🚀 Installation & Usage
+
+### Prerequisites
+- [Go](https://go.dev/dl/) installed.
+
+### Run from Source
+```bash
+# Clone the repository
+git clone https://github.com/mauvernaz/todoTUI.git
+cd todoTUI
+
+# Run directly
+go run .
+
+# Or build the executable
+go build -o todotui.exe
+./todotui.exe
 ```
 
 ---
 
-## 📖 Commands & Help
+## ⌨️ Controls
 
-Once inside the app, you can press **`?`** or **`h`** to see the full help menu.
+The application uses **Vim-style** navigation alongside standard Arrow keys.
 
-### Navigation
-- `↑` or `k`: Move selection up
-- `↓` or `j`: Move selection down
+### 🧭 Navigation
+| Key | Action |
+| :--- | :--- |
+| **`Tab`** | **Toggle View Mode** (Full Window / Compact) |
+| **`←`** / **`h`** | Go to **Group List** |
+| **`→`** / **`l`** | Enter **selected Group** (Task View) |
+| **`Enter`** | Enter **selected Group** (Task View) |
+| **`↑`** / **`k`** | Move Cursor Up |
+| **`↓`** / **`j`** | Move Cursor Down |
 
-### Task Management
-- `n` or `a`: **Add** a new task (enters Input Mode)
-- `x`, `d`, or `Backspace`: **Delete** selected task
-- `Enter`: **Save** task (when in Input Mode)
-
-### Application
-- `?` or `h`: Toggle **Help** view
-- `q` or `Esc`: **Quit** or return to list
-- `Ctrl+C`: Force quit
+### ⚡ Actions
+| Key | Context | Action |
+| :--- | :--- | :--- |
+| **`n`** | Any | **New** Group (if in Group List) or Task (if in Task List) |
+| **`r`** | Any | **Rename** Selected Group or Task |
+| **`x`** | Any | **Delete** Selected Item |
+| **`Space`** | Tasks | **Toggle Done/Undone** |
+| **`Ctrl+x`** | Deletion | **Confirm Deletion** (for groups with tasks) |
+| **`Esc`** | Input | **Cancel** Input / Return to List |
+| **`q`** | Global | **Quit** Application |
 
 ---
 
-## 🛠️ Development
-- **Language**: Go
-- **Framework**: [Bubble Tea](https://github.com/charmbracelet/bubbletea)
+## 💾 Data Persistence
+
+Your data is automatically saved to a JSON file in your user configuration directory:
+- **Windows**: `C:\Users\%USERNAME%\AppData\Roaming\todotui\todos.json`
+- **Linux/Mac**: `~/.config/todotui/todos.json`
+
+The file is human-readable and can be backed up or edited manually if needed.
+
+---
+
+## 🛠️ Built With
+
+- **Language**: [Go](https://go.dev/)
+- **TUI Framework**: [Bubble Tea](https://github.com/charmbracelet/bubbletea)
 - **Styling**: [Lip Gloss](https://github.com/charmbracelet/lipgloss)
-- **Input**: [Bubbles](https://github.com/charmbracelet/bubbles)
+- **Input Components**: [Bubbles](https://github.com/charmbracelet/bubbles)
+
+---
+
+## 📄 License
+
+MIT License. Free to use and modify.
