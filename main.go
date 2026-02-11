@@ -98,8 +98,11 @@ var (
 
 // Get deterministic color for a group based on its index
 func getGroupColor(index int) lipgloss.Color {
+	if index == 0 {
+		return lipgloss.Color("250") // Light Gray for Default Group (Index 0)
+	}
 	if index < 0 {
-		return lipgloss.Color("255") // Fallback White
+		return lipgloss.Color("255") // Fallback White (shouldn't happen)
 	}
 	return palette[index%len(palette)]
 }
@@ -447,20 +450,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 
 		case "r":
-			m.mode = renaming
 			if m.mode == viewGroups {
 				m.renameType = 0
 				m.input.SetValue(m.state.Groups[m.groupCursor])
-			} else { // viewTasks
+				m.mode = renaming
+			} else if m.mode == viewTasks {
 				m.renameType = 1
 				visible := m.getVisibleTasks()
 				if m.cursor < len(visible) {
 					realIdx := visible[m.cursor]
 					m.input.SetValue(m.state.Todos[realIdx].Title)
+					m.mode = renaming
 				}
 			}
-			m.input.Focus()
-			return m, textinput.Blink
+			// Only focus if we actually entered renaming mode?
+			// Check if we set mode to renaming?
+			if m.mode == renaming {
+				m.input.Focus()
+				return m, textinput.Blink
+			}
 
 		case "x":
 			if m.mode == viewGroups {
