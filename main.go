@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -22,7 +23,7 @@ type Todo struct {
 
 type AppState struct {
 	Todos     []Todo   `json:"todos"`
-	Groups    []string `json:"groups"` // Index 0 is Default/Inbox
+	Groups    []string `json:"groups"` // Index 0 is Default/Inbox/All
 	LastGroup string   `json:"last_group"`
 }
 
@@ -39,7 +40,7 @@ const (
 
 type model struct {
 	state       AppState
-	cursor      int // Task cursor
+	cursor      int // Task cursor (in the VISIBLE list)
 	groupCursor int // Group cursor
 	input       textinput.Model
 
@@ -150,7 +151,7 @@ func loadTodos() AppState {
 		if len(state.Groups) == 0 {
 			state.Groups = []string{"All"}
 		}
-		if state.LastGroup == "" {
+		if state.LastGroup == "" { // keep basic sanitization, though we ignore it for view mode
 			state.LastGroup = state.Groups[0]
 		}
 		// Ensure tasks map to valid groups (or default to Index 0)
@@ -162,9 +163,7 @@ func loadTodos() AppState {
 		return state
 	}
 
-	// Fallback/Migration would go here, but omitted for brevity as we are rewriting.
-	// Assuming Migration done or fresh start for this specific request context.
-	// Actually, let's keep basic migration just in case.
+	// Fallback/Migration logic
 	var oldTodos []Todo
 	if err := json.Unmarshal(data, &oldTodos); err == nil {
 		for i := range oldTodos {
@@ -204,13 +203,42 @@ func initialModel() model {
 	return model{
 		state:       state,
 		input:       ti,
-		mode:        viewTasks,
+		mode:        viewGroups, // FORCE START IN GROUP VIEW
 		compactMode: false,
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return tea.EnterAltScreen
+}
+
+// --- HELPER: SORTING & FILTERING ---
+
+// Returns a sorted list of INDICES into m.state.Todos
+// Filtered by current group (or All)
+// Sorted by Done status (Active first)
+func (m model) getVisibleTasks() []int {
+	var visible []int
+	isAll := (m.state.LastGroup == m.state.Groups[0])
+
+	for i, t := range m.state.Todos {
+		if isAll || t.Group == m.state.LastGroup {
+			visible = append(visible, i)
+		}
+	}
+
+	// STABLE SORT: Active (!Done) before Done
+	sort.SliceStable(visible, func(i, j int) bool {
+		t1 := m.state.Todos[visible[i]]
+		t2 := m.state.Todos[visible[j]]
+
+		if t1.Done != t2.Done {
+			return !t1.Done // If t1 is not done (true), it comes before t2 (false)
+		}
+		return false // Maintain original order otherwise
+	})
+
+	return visible
 }
 
 // --- UPDATE ---
@@ -245,17 +273,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 									m.state.Todos[i].Group = val
 								}
 							}
-							// Update LastGroup
 							if m.state.LastGroup == oldName {
 								m.state.LastGroup = val
 							}
 							m.mode = viewGroups
 						} else { // Task
-							// Rename currently selected task
-							// We need to find it based on current View logic
-							targetIdx := m.getTaskIndexAtCursor()
-							if targetIdx != -1 {
-								m.state.Todos[targetIdx].Title = val
+							visible := m.getVisibleTasks()
+							if m.cursor < len(visible) {
+								realIdx := visible[m.cursor]
+								m.state.Todos[realIdx].Title = val
 							}
 							m.mode = viewTasks
 						}
@@ -265,14 +291,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							// Add Group
 							m.state.Groups = append(m.state.Groups, val)
 							m.state.LastGroup = val
-							m.mode = viewTasks
+							m.mode = viewTasks // Auto-enter new group? Sure.
+							m.cursor = 0
 						} else {
 							// Add Task
 							targetGroup := m.state.LastGroup
-
-							// CRITICAL FIX: If viewing "All" (Index 0), assign to "All" (Index 0)
-							// Actually, LastGroup keeps track of what we are viewing.
-							// So if LastGroup == Groups[0], we assign to Groups[0].
+							// If in "All" view (Index 0), assign to "All" (Index 0)
+							// Actually, LastGroup == m.state.Groups[0] already handles this.
 							m.state.Todos = append(m.state.Todos, Todo{Title: val, Done: false, Group: targetGroup})
 						}
 						m.adding = false
@@ -370,26 +395,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.groupCursor++
 				}
 			} else {
-				// Cap cursor at filtered list length
-				count := m.getFilteredTaskCount()
-				if m.cursor < count-1 {
+				visibleCount := len(m.getVisibleTasks()) // This is slightly expensive to recalc, but safe for TUI sizes
+				if m.cursor < visibleCount-1 {
 					m.cursor++
 				}
 			}
 		case "left", "h":
 			m.mode = viewGroups
 		case "right", "l":
-			// Enter group
-			m.state.LastGroup = m.state.Groups[m.groupCursor]
-			m.mode = viewTasks
-			m.cursor = 0 // Reset cursor when entering
+			if m.mode == viewGroups {
+				// Enter group
+				m.state.LastGroup = m.state.Groups[m.groupCursor]
+				m.mode = viewTasks
+				m.cursor = 0
+			}
+			// In viewTasks, right does nothing or stays
 
 		case " ":
 			// Toggle Done
 			if m.mode == viewTasks {
-				targetIdx := m.getTaskIndexAtCursor()
-				if targetIdx != -1 {
-					m.state.Todos[targetIdx].Done = !m.state.Todos[targetIdx].Done
+				visible := m.getVisibleTasks()
+				if m.cursor < len(visible) {
+					realIdx := visible[m.cursor]
+					m.state.Todos[realIdx].Done = !m.state.Todos[realIdx].Done
 					saveTodos(m.state)
 				}
 			}
@@ -400,11 +428,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mode = viewTasks
 				m.cursor = 0
 			} else {
-				// Toggle Done on Enter too? Or maybe Edit?
-				// Standard is usually toggle or edit. Let's keep toggle for now.
-				targetIdx := m.getTaskIndexAtCursor()
-				if targetIdx != -1 {
-					m.state.Todos[targetIdx].Done = !m.state.Todos[targetIdx].Done
+				// ViewTasks: Toggle on Enter too?
+				visible := m.getVisibleTasks()
+				if m.cursor < len(visible) {
+					realIdx := visible[m.cursor]
+					m.state.Todos[realIdx].Done = !m.state.Todos[realIdx].Done
 					saveTodos(m.state)
 				}
 			}
@@ -423,11 +451,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.mode == viewGroups {
 				m.renameType = 0
 				m.input.SetValue(m.state.Groups[m.groupCursor])
-			} else {
+			} else { // viewTasks
 				m.renameType = 1
-				targetIdx := m.getTaskIndexAtCursor()
-				if targetIdx != -1 {
-					m.input.SetValue(m.state.Todos[targetIdx].Title)
+				visible := m.getVisibleTasks()
+				if m.cursor < len(visible) {
+					realIdx := visible[m.cursor]
+					m.input.SetValue(m.state.Todos[realIdx].Title)
 				}
 			}
 			m.input.Focus()
@@ -460,11 +489,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					saveTodos(m.state)
 				}
 			} else {
-				// Task Deletion: Global Delete
-				targetIdx := m.getTaskIndexAtCursor()
-				if targetIdx != -1 {
-					m.state.Todos = append(m.state.Todos[:targetIdx], m.state.Todos[targetIdx+1:]...)
-					if m.cursor > 0 {
+				// Task Deletion: Global Delete in "All" too
+				visible := m.getVisibleTasks()
+				if m.cursor < len(visible) {
+					realIdx := visible[m.cursor]
+					// Remove from slice
+					m.state.Todos = append(m.state.Todos[:realIdx], m.state.Todos[realIdx+1:]...)
+
+					// Cursor fix: if we delete the last item, move cursor up
+					if m.cursor >= len(visible)-1 && m.cursor > 0 {
 						m.cursor--
 					}
 					saveTodos(m.state)
@@ -473,50 +506,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, cmd
-}
-
-// --- HELPERS ---
-
-// Calculates how many tasks are visible in the current view
-func (m model) getFilteredTaskCount() int {
-	isAll := (m.state.LastGroup == m.state.Groups[0])
-	if isAll {
-		return len(m.state.Todos)
-	}
-	count := 0
-	for _, t := range m.state.Todos {
-		if t.Group == m.state.LastGroup {
-			count++
-		}
-	}
-	return count
-}
-
-// Gets the actual index in m.state.Todos for the item under the cursor in the filtered view
-func (m model) getTaskIndexAtCursor() int {
-	isAll := (m.state.LastGroup == m.state.Groups[0])
-
-	// If viewing "All", it's straight 1:1 map?
-	// YES. The aggregation view shows EVERY task.
-	// We just need to ensure m.cursor is valid.
-	if isAll {
-		if m.cursor >= 0 && m.cursor < len(m.state.Todos) {
-			return m.cursor
-		}
-		return -1
-	}
-
-	// Filtered view
-	filteredIdx := 0
-	for i, t := range m.state.Todos {
-		if t.Group == m.state.LastGroup {
-			if filteredIdx == m.cursor {
-				return i
-			}
-			filteredIdx++
-		}
-	}
-	return -1
 }
 
 // --- VIEW ---
@@ -549,7 +538,7 @@ func (m model) View() string {
 			// Render content
 			content := g
 			if m.mode == renaming && m.groupCursor == i {
-				content = m.input.View()
+				content = m.input.View() // Edit in place
 			}
 
 			// Delete Confirm
@@ -575,7 +564,6 @@ func (m model) View() string {
 		isAll := (currentGroup == m.state.Groups[0])
 
 		// Header
-		// Use color of the current group
 		groupIndex := m.state.getGroupIndex(currentGroup)
 		groupColor := getGroupColor(groupIndex)
 
@@ -586,60 +574,51 @@ func (m model) View() string {
 		)
 		s.WriteString(header + "\n\n")
 
-		// Render List
-		filteredIdx := 0
-		hasTasks := false
+		// Render List (Using Sorted Helper)
+		visibleIndices := m.getVisibleTasks()
 
-		// We iterate ALL tasks.
-		// If "All" view (Index 0): Show Everything.
-		// Else: Show only matching.
-		for _, t := range m.state.Todos {
-			if !isAll && t.Group != currentGroup {
-				continue
-			}
-			hasTasks = true
-
-			cursor := "  "
-			if m.cursor == filteredIdx && !m.adding {
-				cursor = "> "
-			}
-
-			// Determine display style
-			tStyle := lipgloss.NewStyle()
-			if t.Done {
-				tStyle = tStyle.Strikethrough(true).Faint(true)
-			} else {
-				tStyle = tStyle.Foreground(lipgloss.Color("255"))
-			}
-
-			// Active Item Highlight
-			if m.cursor == filteredIdx && !m.adding {
-				tStyle = tStyle.Foreground(groupColor)
-				cursor = lipgloss.NewStyle().Foreground(groupColor).Render(cursor)
-			}
-
-			// Rename Input Overlay
-			title := t.Title
-			if m.mode == renaming && m.renameType == 1 && m.cursor == filteredIdx {
-				title = m.input.View()
-			}
-
-			// Group Tag (Only in "All" view)
-			var suffix string
-			if isAll {
-				// Find group color for this task
-				tIdx := m.state.getGroupIndex(t.Group)
-				c := getGroupColor(tIdx)
-				suffix = lipgloss.NewStyle().Foreground(c).Faint(true).Render(fmt.Sprintf(" [%s]", t.Group))
-			}
-
-			s.WriteString(fmt.Sprintf("%s%s%s\n", cursor, tStyle.Render(title), suffix))
-
-			filteredIdx++
-		}
-
-		if !hasTasks {
+		if len(visibleIndices) == 0 {
 			s.WriteString(lipgloss.NewStyle().Faint(true).Render("  No tasks found.") + "\n")
+		} else {
+			for i, realIdx := range visibleIndices {
+				t := m.state.Todos[realIdx]
+
+				cursor := "  "
+				// Check against View List Cursor
+				if m.cursor == i && !m.adding {
+					cursor = "> "
+				}
+
+				// Style
+				tStyle := lipgloss.NewStyle()
+				if t.Done {
+					tStyle = tStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
+				} else {
+					tStyle = tStyle.Foreground(lipgloss.Color("255"))
+				}
+
+				// Active Item Highlight
+				if m.cursor == i && !m.adding {
+					tStyle = tStyle.Foreground(groupColor)
+					cursor = lipgloss.NewStyle().Foreground(groupColor).Render(cursor)
+				}
+
+				// Rename Input Overlay
+				title := t.Title
+				if m.mode == renaming && m.renameType == 1 && m.cursor == i {
+					title = m.input.View()
+				}
+
+				// Group Tag (Only in "All" view) -> [Group] Title
+				var prefix string
+				if isAll {
+					tIdx := m.state.getGroupIndex(t.Group)
+					c := getGroupColor(tIdx)
+					prefix = lipgloss.NewStyle().Foreground(c).Render(fmt.Sprintf("[%s] ", t.Group))
+				}
+
+				s.WriteString(fmt.Sprintf("%s%s%s\n", cursor, prefix, tStyle.Render(title)))
+			}
 		}
 
 		s.WriteString("\n")
@@ -655,7 +634,6 @@ func (m model) View() string {
 
 	// Full vs Compact
 	if !m.compactMode {
-		// Border matches current group color logic IF in task view, else Default
 		borderColor := lipgloss.Color("62")
 		if m.mode == viewTasks {
 			idx := m.state.getGroupIndex(m.state.LastGroup)
