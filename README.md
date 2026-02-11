@@ -38,8 +38,8 @@ cd todoTUI
 go run .
 
 # Or build the executable
-go build -o todotui.exe
-./todotui.exe
+go build -o todo.exe
+./todo.exe
 ```
 
 ---
