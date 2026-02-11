@@ -42,6 +42,15 @@ go build -o todo.exe
 ./todo.exe
 ```
 
+### 🌍 Global Access (Recommended)
+To run `todo` from anywhere, add the directory containing `todo.exe` to your system's **PATH**.
+
+**Windows Users:**
+1. Search for **"Edit environment variables for your account"**.
+2. Select the `Path` variable and click **Edit**.
+3. Click **New** and paste the full path to your `todoTUI` folder (e.g., `C:\Users\YourName\Documents\todoTUI`).
+4. **Restart your terminal.** Now you can type `todo` from any folder!
+
 ---
 
 ## ⌨️ Controls
