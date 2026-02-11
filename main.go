@@ -12,44 +12,77 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// --- DATA STRUCTURES ---
+
 type Todo struct {
 	Title string `json:"title"`
 	Done  bool   `json:"done"`
-	Group string `json:"group"` // New field
+	Group string `json:"group"`
 }
 
 type AppState struct {
 	Todos     []Todo   `json:"todos"`
-	Groups    []string `json:"groups"`
+	Groups    []string `json:"groups"` // Index 0 is Default/Inbox
 	LastGroup string   `json:"last_group"`
 }
+
+// --- STATE MANAGEMENT ---
+
+type sessionState int
+
+const (
+	viewGroups sessionState = iota
+	viewTasks
+	renaming
+	deletingGroup
+)
 
 type model struct {
 	state       AppState
 	cursor      int // Task cursor
 	groupCursor int // Group cursor
 	input       textinput.Model
-	adding      bool // adding a task
-	addingGroup bool // adding a group
-	quitting    bool
-	viewMode    int // 0: Groups, 1: Tasks
-	err         error
-	width       int
-	height      int
+
+	mode        sessionState
+	compactMode bool
+
+	// Input/Confirmation State
+	adding     bool
+	renameType int // 0: Group, 1: Task
+
+	quitting bool
+	err      error
+	width    int
+	height   int
 }
 
-const (
-	ViewGroups = iota
-	ViewTasks
-)
+// --- STYLING & COLORS ---
 
-// Styling
 var (
-	// Compact Mode Styles (Raw) - Kept for legacy/simplicity if needed, but we focus on Groups now
-	cursorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	// Expanded Palette (20+ colors)
+	palette = []lipgloss.Color{
+		lipgloss.Color("#FFB6C1"), // LightPink
+		lipgloss.Color("#87CEFA"), // LightSkyBlue
+		lipgloss.Color("#90EE90"), // LightGreen
+		lipgloss.Color("#FFD700"), // Gold
+		lipgloss.Color("#FFA07A"), // LightSalmon
+		lipgloss.Color("#DDA0DD"), // Plum
+		lipgloss.Color("#F0E68C"), // Khaki
+		lipgloss.Color("#00CED1"), // DarkTurquoise
+		lipgloss.Color("#FF69B4"), // HotPink
+		lipgloss.Color("#6495ED"), // CornflowerBlue
+		lipgloss.Color("#32CD32"), // LimeGreen
+		lipgloss.Color("#FF4500"), // OrangeRed
+		lipgloss.Color("#BA55D3"), // MediumOrchid
+		lipgloss.Color("#00FA9A"), // MediumSpringGreen
+		lipgloss.Color("#4169E1"), // RoyalBlue
+		lipgloss.Color("#DC143C"), // Crimson
+		lipgloss.Color("#00BFFF"), // DeepSkyBlue
+		lipgloss.Color("#9370DB"), // MediumPurple
+		lipgloss.Color("#3CB371"), // MediumSeaGreen
+		lipgloss.Color("#FF6347"), // Tomato
+	}
 
-	// Full Mode Styles
 	appStyle = lipgloss.NewStyle().
 			Padding(1, 2).
 			Border(lipgloss.RoundedBorder()).
@@ -60,13 +93,27 @@ var (
 			Background(lipgloss.Color("62")).
 			Padding(0, 1).
 			Bold(true)
-
-	groupSelectedStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("230")).
-				Background(lipgloss.Color("57")).
-				Padding(0, 1).
-				Bold(true)
 )
+
+// Get deterministic color for a group based on its index
+func getGroupColor(index int) lipgloss.Color {
+	if index < 0 {
+		return lipgloss.Color("255") // Fallback White
+	}
+	return palette[index%len(palette)]
+}
+
+// Find group index by name (helper for coloring)
+func (s AppState) getGroupIndex(name string) int {
+	for i, g := range s.Groups {
+		if g == name {
+			return i
+		}
+	}
+	return 0 // Default to 0 if not found
+}
+
+// --- PERSISTENCE ---
 
 func getTodoPath() (string, error) {
 	configDir, err := os.UserConfigDir()
@@ -74,7 +121,6 @@ func getTodoPath() (string, error) {
 		return "", err
 	}
 	todoDir := filepath.Join(configDir, "todotui")
-	// Ensure directory exists
 	if err := os.MkdirAll(todoDir, 0755); err != nil {
 		return "", err
 	}
@@ -84,8 +130,8 @@ func getTodoPath() (string, error) {
 func loadTodos() AppState {
 	defaultState := AppState{
 		Todos:     []Todo{},
-		Groups:    []string{}, // "ALL" is implicit
-		LastGroup: "ALL",
+		Groups:    []string{"All"}, // Rename "General" to "All" or user preference. Index 0 is Aggregator.
+		LastGroup: "All",
 	}
 
 	path, err := getTodoPath()
@@ -98,50 +144,37 @@ func loadTodos() AppState {
 		return defaultState
 	}
 
-	// Try unmarshalling as AppState first
 	var state AppState
+	// Try AppState (New Format)
 	if err := json.Unmarshal(data, &state); err == nil {
-		// Basic validation: if it has Groups or LastGroup or Todos (and not just empty), accept it.
-		// Use a heuristic: if strict JSON unmarshal worked, it might be the new format.
-		// However, old format []Todo might technically unmarshal into empty AppState if fields mismatch?
-		// Actually json.Unmarshal ignores unknown fields.
-		// Let's try unmarshalling into a generic map to check structure or just try []Todo if State looks empty.
-		// Better approach: Try []Todo first (migration), if that fails (structure mismatch), assume it's AppState?
-		// Or try AppState, check if LastGroup is set (it should be if saved correctly).
-
-		// Let's rely on checking if it unmarshals successfully as []Todo.
-		var oldTodos []Todo
-		if errOld := json.Unmarshal(data, &oldTodos); errOld == nil {
-			// It MIGHT be the old format.
-			// But wait, AppState is an object {}, []Todo is a list [].
-			// json.Unmarshal will fail if we try to unmarshal a list into a struct.
-			// So relying on error is safe!
+		if len(state.Groups) == 0 {
+			state.Groups = []string{"All"}
 		}
-	}
-
-	// Correct Logic:
-	// 1. Try to unmarshal as []Todo (Old Format - Array)
-	var oldTodos []Todo
-	if err := json.Unmarshal(data, &oldTodos); err == nil {
-		// It IS a list. valid old format. Migrate.
-		// Assign all existing todos to "General"
-		for i := range oldTodos {
-			oldTodos[i].Group = "General"
-		}
-		// Return new state
-		return AppState{
-			Todos:     oldTodos,
-			Groups:    []string{"General"},
-			LastGroup: "General",
-		}
-	}
-
-	// 2. Try AppState (New Format - Object)
-	if err := json.Unmarshal(data, &state); err == nil {
 		if state.LastGroup == "" {
-			state.LastGroup = "ALL"
+			state.LastGroup = state.Groups[0]
+		}
+		// Ensure tasks map to valid groups (or default to Index 0)
+		for i := range state.Todos {
+			if state.Todos[i].Group == "" {
+				state.Todos[i].Group = state.Groups[0]
+			}
 		}
 		return state
+	}
+
+	// Fallback/Migration would go here, but omitted for brevity as we are rewriting.
+	// Assuming Migration done or fresh start for this specific request context.
+	// Actually, let's keep basic migration just in case.
+	var oldTodos []Todo
+	if err := json.Unmarshal(data, &oldTodos); err == nil {
+		for i := range oldTodos {
+			oldTodos[i].Group = "All"
+		}
+		return AppState{
+			Todos:     oldTodos,
+			Groups:    []string{"All"},
+			LastGroup: "All",
+		}
 	}
 
 	return defaultState
@@ -152,7 +185,6 @@ func saveTodos(state AppState) {
 	if err != nil {
 		return
 	}
-
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return
@@ -160,68 +192,28 @@ func saveTodos(state AppState) {
 	_ = os.WriteFile(path, data, 0644)
 }
 
-// Generate a consistent color for a group name
-func getGroupColor(name string) lipgloss.Color {
-	colors := []string{
-		"#FFB6C1", // LightPink
-		"#87CEFA", // LightSkyBlue
-		"#90EE90", // LightGreen
-		"#FFD700", // Gold
-		"#FFA07A", // LightSalmon
-		"#DDA0DD", // Plum
-		"#F0E68C", // Khaki
-		"#00CED1", // DarkTurquoise
-	}
-	hash := 0
-	for _, c := range name {
-		hash = int(c) + ((hash << 5) - hash)
-	}
-	if hash < 0 {
-		hash = -hash
-	}
-	return lipgloss.Color(colors[hash%len(colors)])
-}
+// --- INIT ---
 
 func initialModel() model {
 	state := loadTodos()
-
 	ti := textinput.New()
 	ti.Placeholder = "New task..."
 	ti.Focus()
 	ti.Prompt = ""
 
-	m := model{
-		state:    state,
-		input:    ti,
-		adding:   false,
-		viewMode: ViewTasks, // Default start
+	return model{
+		state:       state,
+		input:       ti,
+		mode:        viewTasks,
+		compactMode: false,
 	}
-
-	// Handle Auto-Resume logic
-	if state.LastGroup == "ALL" {
-		m.viewMode = ViewTasks // redundant but explicit
-		// Filter logic happens in View/Update, but we need to set state so we know what we are viewing.
-		// Actually LastGroup is already in m.state.
-	} else {
-		// Find if the group still exists
-		exists := false
-		for _, g := range state.Groups {
-			if g == state.LastGroup {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			m.state.LastGroup = "ALL"
-		}
-	}
-
-	return m
 }
 
 func (m model) Init() tea.Cmd {
 	return tea.EnterAltScreen
 }
+
+// --- UPDATE ---
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.quitting {
@@ -236,64 +228,134 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 
 	case tea.KeyMsg:
-		// HANDLE INPUT MODES
-		if m.adding || m.addingGroup {
+		// 1. INPUT HANDLING (Adding / Renaming)
+		if m.adding || m.mode == renaming {
 			switch msg.Type {
 			case tea.KeyEnter:
 				val := m.input.Value()
 				if val != "" {
-					if m.addingGroup {
-						// Add Group
-						m.state.Groups = append(m.state.Groups, val)
-						m.state.LastGroup = val
-						m.viewMode = ViewTasks
-						m.addingGroup = false
-					} else {
-						// Add Task
-						group := m.state.LastGroup
-						if group == "ALL" {
-							group = "General"
+					if m.mode == renaming {
+						// RENAME LOGIC
+						if m.renameType == 0 { // Group
+							oldName := m.state.Groups[m.groupCursor]
+							m.state.Groups[m.groupCursor] = val
+							// Update Tasks
+							for i := range m.state.Todos {
+								if m.state.Todos[i].Group == oldName {
+									m.state.Todos[i].Group = val
+								}
+							}
+							// Update LastGroup
+							if m.state.LastGroup == oldName {
+								m.state.LastGroup = val
+							}
+							m.mode = viewGroups
+						} else { // Task
+							// Rename currently selected task
+							// We need to find it based on current View logic
+							targetIdx := m.getTaskIndexAtCursor()
+							if targetIdx != -1 {
+								m.state.Todos[targetIdx].Title = val
+							}
+							m.mode = viewTasks
 						}
-						m.state.Todos = append(m.state.Todos, Todo{Title: val, Done: false, Group: group})
-						// Move cursor to bottom of list? Or stay. let's stay logic or set to end.
-						// We need to know where it appears in the filtered list.
-						// Simple: Reset cursor or don't worry for now.
+					} else { // Adding
+						// ADD LOGIC
+						if m.mode == viewGroups {
+							// Add Group
+							m.state.Groups = append(m.state.Groups, val)
+							m.state.LastGroup = val
+							m.mode = viewTasks
+						} else {
+							// Add Task
+							targetGroup := m.state.LastGroup
+
+							// CRITICAL FIX: If viewing "All" (Index 0), assign to "All" (Index 0)
+							// Actually, LastGroup keeps track of what we are viewing.
+							// So if LastGroup == Groups[0], we assign to Groups[0].
+							m.state.Todos = append(m.state.Todos, Todo{Title: val, Done: false, Group: targetGroup})
+						}
 						m.adding = false
 					}
 					saveTodos(m.state)
 					m.input.Reset()
 				} else {
+					// Empty input cancels
 					m.adding = false
-					m.addingGroup = false
+					if m.mode == renaming {
+						if m.renameType == 0 {
+							m.mode = viewGroups
+						} else {
+							m.mode = viewTasks
+						}
+					}
 				}
 				return m, nil
+
 			case tea.KeyEsc:
 				m.adding = false
-				m.addingGroup = false
 				m.input.Reset()
+				if m.mode == renaming {
+					if m.renameType == 0 {
+						m.mode = viewGroups
+					} else {
+						m.mode = viewTasks
+					}
+				}
 				return m, nil
 			}
 			m.input, cmd = m.input.Update(msg)
 			return m, cmd
 		}
 
-		// HANDLE NAVIGATION KEYS
+		// 2. CONFIRMATION (Deletion)
+		if m.mode == deletingGroup {
+			switch msg.String() {
+			case "ctrl+x":
+				targetGroup := m.state.Groups[m.groupCursor]
+				// Cascade delete tasks
+				newTodos := []Todo{}
+				for _, t := range m.state.Todos {
+					if t.Group != targetGroup {
+						newTodos = append(newTodos, t)
+					}
+				}
+				m.state.Todos = newTodos
+				// Delete group
+				m.state.Groups = append(m.state.Groups[:m.groupCursor], m.state.Groups[m.groupCursor+1:]...)
+				// Reset navigation
+				if m.groupCursor >= len(m.state.Groups) {
+					m.groupCursor = len(m.state.Groups) - 1
+				}
+				if len(m.state.Groups) > 0 {
+					m.state.LastGroup = m.state.Groups[0]
+				}
+				m.mode = viewGroups
+				saveTodos(m.state)
+				return m, nil
+			case "n", "esc":
+				m.mode = viewGroups
+				return m, nil
+			}
+			return m, nil
+		}
+
+		// 3. NAVIGATION & COMMANDS
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
 
 		case "tab":
-			// Cycle views? Or just use h/l
-			if m.viewMode == ViewGroups {
-				m.viewMode = ViewTasks
-			} else {
-				m.viewMode = ViewGroups
+			m.compactMode = !m.compactMode
+			if m.compactMode {
+				return m, tea.ExitAltScreen
 			}
+			return m, tea.EnterAltScreen
 
-		// Navigation
+		// ARROWS / VI KEYS
 		case "up", "k":
-			if m.viewMode == ViewGroups {
+			if m.mode == viewGroups {
 				if m.groupCursor > 0 {
 					m.groupCursor--
 				}
@@ -303,127 +365,161 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case "down", "j":
-			if m.viewMode == ViewGroups {
-				// Groups list is Groups + "ALL"
-				if m.groupCursor < len(m.state.Groups) { // +1 for ALL, so max index is len
+			if m.mode == viewGroups {
+				if m.groupCursor < len(m.state.Groups)-1 {
 					m.groupCursor++
 				}
 			} else {
-				// We need filtered count to cap cursor
-				filteredCount := 0
-				for _, t := range m.state.Todos {
-					if m.state.LastGroup == "ALL" || t.Group == m.state.LastGroup {
-						filteredCount++
-					}
-				}
-				if m.cursor < filteredCount-1 {
+				// Cap cursor at filtered list length
+				count := m.getFilteredTaskCount()
+				if m.cursor < count-1 {
 					m.cursor++
 				}
 			}
-
-		// Mode Switching
 		case "left", "h":
-			if m.viewMode == ViewTasks {
-				m.viewMode = ViewGroups
-			}
+			m.mode = viewGroups
 		case "right", "l":
-			if m.viewMode == ViewGroups {
-				// Select the group at cursor
-				m.selectGroupAtCursor()
-				m.viewMode = ViewTasks
-				m.cursor = 0 // Reset task cursor
-				saveTodos(m.state)
-			} else {
-				// In Task view, l could toggle? Or nothing.
+			// Enter group
+			m.state.LastGroup = m.state.Groups[m.groupCursor]
+			m.mode = viewTasks
+			m.cursor = 0 // Reset cursor when entering
+
+		case " ":
+			// Toggle Done
+			if m.mode == viewTasks {
+				targetIdx := m.getTaskIndexAtCursor()
+				if targetIdx != -1 {
+					m.state.Todos[targetIdx].Done = !m.state.Todos[targetIdx].Done
+					saveTodos(m.state)
+				}
 			}
 
 		case "enter":
-			if m.viewMode == ViewGroups {
-				m.selectGroupAtCursor()
-				m.viewMode = ViewTasks
+			if m.mode == viewGroups {
+				m.state.LastGroup = m.state.Groups[m.groupCursor]
+				m.mode = viewTasks
 				m.cursor = 0
-				saveTodos(m.state)
 			} else {
-				// Toggle Task Done
-				m.toggleTaskAtCursor()
-				saveTodos(m.state)
+				// Toggle Done on Enter too? Or maybe Edit?
+				// Standard is usually toggle or edit. Let's keep toggle for now.
+				targetIdx := m.getTaskIndexAtCursor()
+				if targetIdx != -1 {
+					m.state.Todos[targetIdx].Done = !m.state.Todos[targetIdx].Done
+					saveTodos(m.state)
+				}
 			}
 
 		case "n":
-			if m.viewMode == ViewGroups {
-				m.addingGroup = true
-				m.input.Placeholder = "New Group Name..."
+			m.adding = true
+			m.input.Placeholder = "New..."
+			if m.mode == viewGroups {
+				m.input.Placeholder = "New Group..."
+			}
+			m.input.Focus()
+			return m, textinput.Blink
+
+		case "r":
+			m.mode = renaming
+			if m.mode == viewGroups {
+				m.renameType = 0
+				m.input.SetValue(m.state.Groups[m.groupCursor])
 			} else {
-				m.adding = true
-				m.input.Placeholder = "New Task..."
+				m.renameType = 1
+				targetIdx := m.getTaskIndexAtCursor()
+				if targetIdx != -1 {
+					m.input.SetValue(m.state.Todos[targetIdx].Title)
+				}
 			}
 			m.input.Focus()
 			return m, textinput.Blink
 
 		case "x":
-			if m.viewMode == ViewTasks {
-				m.deleteTaskAtCursor()
-				saveTodos(m.state)
+			if m.mode == viewGroups {
+				// Group Deletion
+				if m.groupCursor == 0 {
+					return m, nil
+				} // Protected Index 0
+
+				// Check for content
+				hasTasks := false
+				target := m.state.Groups[m.groupCursor]
+				for _, t := range m.state.Todos {
+					if t.Group == target {
+						hasTasks = true
+						break
+					}
+				}
+				if hasTasks {
+					m.mode = deletingGroup
+				} else {
+					// Empty? Delete now
+					m.state.Groups = append(m.state.Groups[:m.groupCursor], m.state.Groups[m.groupCursor+1:]...)
+					if m.groupCursor >= len(m.state.Groups) {
+						m.groupCursor = len(m.state.Groups) - 1
+					}
+					saveTodos(m.state)
+				}
+			} else {
+				// Task Deletion: Global Delete
+				targetIdx := m.getTaskIndexAtCursor()
+				if targetIdx != -1 {
+					m.state.Todos = append(m.state.Todos[:targetIdx], m.state.Todos[targetIdx+1:]...)
+					if m.cursor > 0 {
+						m.cursor--
+					}
+					saveTodos(m.state)
+				}
 			}
 		}
 	}
 	return m, cmd
 }
 
-// Helpers/Actions
-func (m *model) selectGroupAtCursor() {
-	// Logic: 0 is ALL. 1..N are Groups[0..N-1]
-	if m.groupCursor == 0 {
-		m.state.LastGroup = "ALL"
-	} else {
-		idx := m.groupCursor - 1
-		if idx >= 0 && idx < len(m.state.Groups) {
-			m.state.LastGroup = m.state.Groups[idx]
+// --- HELPERS ---
+
+// Calculates how many tasks are visible in the current view
+func (m model) getFilteredTaskCount() int {
+	isAll := (m.state.LastGroup == m.state.Groups[0])
+	if isAll {
+		return len(m.state.Todos)
+	}
+	count := 0
+	for _, t := range m.state.Todos {
+		if t.Group == m.state.LastGroup {
+			count++
 		}
 	}
+	return count
 }
 
-func (m *model) toggleTaskAtCursor() {
-	filteredIdx := 0
-	targetIdx := -1
+// Gets the actual index in m.state.Todos for the item under the cursor in the filtered view
+func (m model) getTaskIndexAtCursor() int {
+	isAll := (m.state.LastGroup == m.state.Groups[0])
 
+	// If viewing "All", it's straight 1:1 map?
+	// YES. The aggregation view shows EVERY task.
+	// We just need to ensure m.cursor is valid.
+	if isAll {
+		if m.cursor >= 0 && m.cursor < len(m.state.Todos) {
+			return m.cursor
+		}
+		return -1
+	}
+
+	// Filtered view
+	filteredIdx := 0
 	for i, t := range m.state.Todos {
-		if m.state.LastGroup == "ALL" || t.Group == m.state.LastGroup {
+		if t.Group == m.state.LastGroup {
 			if filteredIdx == m.cursor {
-				targetIdx = i
-				break
+				return i
 			}
 			filteredIdx++
 		}
 	}
-
-	if targetIdx != -1 {
-		m.state.Todos[targetIdx].Done = !m.state.Todos[targetIdx].Done
-	}
+	return -1
 }
 
-func (m *model) deleteTaskAtCursor() {
-	filteredIdx := 0
-	targetIdx := -1
-
-	for i, t := range m.state.Todos {
-		if m.state.LastGroup == "ALL" || t.Group == m.state.LastGroup {
-			if filteredIdx == m.cursor {
-				targetIdx = i
-				break
-			}
-			filteredIdx++
-		}
-	}
-
-	if targetIdx != -1 {
-		m.state.Todos = append(m.state.Todos[:targetIdx], m.state.Todos[targetIdx+1:]...)
-		// Adjust cursor if needed
-		if m.cursor > 0 {
-			m.cursor--
-		}
-	}
-}
+// --- VIEW ---
 
 func (m model) View() string {
 	if m.quitting {
@@ -432,78 +528,73 @@ func (m model) View() string {
 
 	var s strings.Builder
 
-	if m.viewMode == ViewGroups {
-		// --- GROUPS VIEW ---
-		s.WriteString(titleStyle.Render("Groups"))
-		s.WriteString("\n\n")
+	// GROUP VIEW / DELETING / RENAMING (If Group)
+	if m.mode == viewGroups || (m.mode == renaming && m.renameType == 0) || m.mode == deletingGroup {
+		s.WriteString(titleStyle.Render("Groups") + "\n\n")
 
-		// List "ALL" first
-		cursor := "  "
-		if m.groupCursor == 0 {
-			cursor = "> "
-		}
-
-		itemStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205")) // Default pinkish
-		if m.groupCursor == 0 {
-			itemStyle = groupSelectedStyle
-		}
-
-		line := fmt.Sprintf("%s%s", cursor, "ALL")
-		s.WriteString(itemStyle.Render(line) + "\n")
-
-		// List Custom Groups
 		for i, g := range m.state.Groups {
-			cursor = "  "
-			if m.groupCursor == i+1 {
+			cursor := "  "
+			if m.groupCursor == i {
 				cursor = "> "
 			}
 
-			// Dynamic Color
-			color := getGroupColor(g)
-			gStyle := lipgloss.NewStyle().Foreground(color)
+			// Color logic
+			color := getGroupColor(i)
+			style := lipgloss.NewStyle().Foreground(color)
 
-			if m.groupCursor == i+1 {
-				gStyle = groupSelectedStyle // Highlight selected row background
-				// Maybe keep fg color?
-				// gStyle = gStyle.Background(lipgloss.Color("57")).Foreground(color) // contrast issues?
-				// Let's stick to simple selection style for now, or just colored text
-				gStyle = lipgloss.NewStyle().Background(lipgloss.Color("57")).Foreground(color).Padding(0, 1).Bold(true)
+			if m.groupCursor == i {
+				style = lipgloss.NewStyle().Background(lipgloss.Color("57")).Foreground(color).Bold(true).Padding(0, 1)
 			}
 
-			line := fmt.Sprintf("%s%s", cursor, g)
-			s.WriteString(gStyle.Render(line) + "\n")
+			// Render content
+			content := g
+			if m.mode == renaming && m.groupCursor == i {
+				content = m.input.View()
+			}
+
+			// Delete Confirm
+			if m.mode == deletingGroup && m.groupCursor == i {
+				content += " [DELETE? Ctrl+x / n]"
+				style = style.Foreground(lipgloss.Color("196"))
+			}
+
+			s.WriteString(fmt.Sprintf("%s%s\n", cursor, style.Render(content)))
 		}
 
 		s.WriteString("\n")
-		if m.addingGroup {
-			s.WriteString(fmt.Sprintf("New Group: %s", m.input.View()))
+		// Footer for Groups
+		if m.adding {
+			s.WriteString("New Group: " + m.input.View())
 		} else {
-			s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Press 'n' to add group • 'l'/'enter' to select"))
+			s.WriteString(lipgloss.NewStyle().Faint(true).Render("Tab: Toggle View • ←/→: Nav • n: Add • r: Rename • x: Delete"))
 		}
 
 	} else {
-		// --- TASKS VIEW ---
+		// TASK VIEW
+		currentGroup := m.state.LastGroup
+		isAll := (currentGroup == m.state.Groups[0])
 
-		// Header: My Tasks > [Group]
-		groupName := m.state.LastGroup
-		groupColor := getGroupColor(groupName)
-		if groupName == "ALL" {
-			groupColor = lipgloss.Color("205")
-		}
+		// Header
+		// Use color of the current group
+		groupIndex := m.state.getGroupIndex(currentGroup)
+		groupColor := getGroupColor(groupIndex)
 
 		header := lipgloss.JoinHorizontal(lipgloss.Left,
-			titleStyle.Render("My Tasks"),
+			titleStyle.Render("Tasks"),
 			lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(" > "),
-			lipgloss.NewStyle().Foreground(groupColor).Bold(true).Render(groupName),
+			lipgloss.NewStyle().Foreground(groupColor).Bold(true).Render(currentGroup),
 		)
 		s.WriteString(header + "\n\n")
 
-		// Filter Tasks & Render
+		// Render List
 		filteredIdx := 0
 		hasTasks := false
 
+		// We iterate ALL tasks.
+		// If "All" view (Index 0): Show Everything.
+		// Else: Show only matching.
 		for _, t := range m.state.Todos {
-			if m.state.LastGroup != "ALL" && t.Group != m.state.LastGroup {
+			if !isAll && t.Group != currentGroup {
 				continue
 			}
 			hasTasks = true
@@ -513,55 +604,68 @@ func (m model) View() string {
 				cursor = "> "
 			}
 
-			// Task Title
-			title := t.Title
+			// Determine display style
 			tStyle := lipgloss.NewStyle()
-
 			if t.Done {
-				tStyle = tStyle.Strikethrough(true).Foreground(lipgloss.Color("240"))
+				tStyle = tStyle.Strikethrough(true).Faint(true)
 			} else {
 				tStyle = tStyle.Foreground(lipgloss.Color("255"))
 			}
 
+			// Active Item Highlight
 			if m.cursor == filteredIdx && !m.adding {
-				tStyle = tStyle.Foreground(lipgloss.Color("205")) // Selection Color
-				cursor = cursorStyle.Render(cursor)
+				tStyle = tStyle.Foreground(groupColor)
+				cursor = lipgloss.NewStyle().Foreground(groupColor).Render(cursor)
 			}
 
-			// Render Line
-			// If ALL view, show group tag
-			var groupTag string
-			if m.state.LastGroup == "ALL" {
-				c := getGroupColor(t.Group)
-				groupTag = lipgloss.NewStyle().Foreground(c).Faint(true).Render(fmt.Sprintf(" [%s]", t.Group))
+			// Rename Input Overlay
+			title := t.Title
+			if m.mode == renaming && m.renameType == 1 && m.cursor == filteredIdx {
+				title = m.input.View()
 			}
 
-			line := fmt.Sprintf("%s%s%s", cursor, tStyle.Render(title), groupTag)
-			s.WriteString(line + "\n")
+			// Group Tag (Only in "All" view)
+			var suffix string
+			if isAll {
+				// Find group color for this task
+				tIdx := m.state.getGroupIndex(t.Group)
+				c := getGroupColor(tIdx)
+				suffix = lipgloss.NewStyle().Foreground(c).Faint(true).Render(fmt.Sprintf(" [%s]", t.Group))
+			}
+
+			s.WriteString(fmt.Sprintf("%s%s%s\n", cursor, tStyle.Render(title), suffix))
 
 			filteredIdx++
 		}
 
 		if !hasTasks {
-			s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  No tasks here."))
-			s.WriteString("\n")
+			s.WriteString(lipgloss.NewStyle().Faint(true).Render("  No tasks found.") + "\n")
 		}
 
 		s.WriteString("\n")
+		// Footer for Tasks
 		if m.adding {
-			s.WriteString(fmt.Sprintf("  %s", m.input.View()))
+			s.WriteString("  " + m.input.View())
 		} else {
-			s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("Press 'n' to add • 'x' to delete • 'h' for groups"))
+			s.WriteString(lipgloss.NewStyle().Faint(true).Render("Tab: Toggle View • ←/→: Nav • n: Add • Space: Done • x: Delete"))
 		}
 	}
 
-	// Window styling container logic
-	// We can wrap the whole thing in appStyle
 	content := s.String()
-	window := appStyle.Render(content)
 
-	// Center
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, window)
+	// Full vs Compact
+	if !m.compactMode {
+		// Border matches current group color logic IF in task view, else Default
+		borderColor := lipgloss.Color("62")
+		if m.mode == viewTasks {
+			idx := m.state.getGroupIndex(m.state.LastGroup)
+			borderColor = getGroupColor(idx)
+		}
+
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+			appStyle.Copy().BorderForeground(borderColor).Render(content))
+	}
+	return content
 }
 
 func main() {
