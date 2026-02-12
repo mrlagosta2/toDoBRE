@@ -4,84 +4,128 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-// --- DATA STRUCTURES ---
+// ─── DATA STRUCTURES ───
+
+type Subtask struct {
+	Title string `json:"title"`
+	Done  bool   `json:"done"`
+}
 
 type Todo struct {
+	Title       string    `json:"title"`
+	Done        bool      `json:"done"`
+	Description string    `json:"description"`
+	Subtasks    []Subtask `json:"subtasks"`
+}
+
+type GroupFile struct {
+	Title string `json:"title"`
+	Todos []Todo `json:"todos"`
+}
+
+// Old format for migration
+type OldTodo struct {
 	Title string `json:"title"`
 	Done  bool   `json:"done"`
 	Group string `json:"group"`
 }
-
-type AppState struct {
-	Todos     []Todo   `json:"todos"`
-	Groups    []string `json:"groups"` // Index 0 is Default/Inbox/All
-	LastGroup string   `json:"last_group"`
+type OldAppState struct {
+	Todos     []OldTodo `json:"todos"`
+	Groups    []string  `json:"groups"`
+	LastGroup string    `json:"last_group"`
 }
 
-// --- STATE MANAGEMENT ---
+// ─── STATE MACHINE ───
 
 type sessionState int
 
 const (
-	viewGroups sessionState = iota
-	viewTasks
-	renaming
-	deletingGroup
+	stateViewWorkspaces sessionState = iota
+	stateViewGroups
+	stateViewTasks
+	stateTaskDetails
+	stateGitMenu
 )
 
+type inputTarget int
+
+const (
+	inputNone inputTarget = iota
+	inputAddWorkspace
+	inputAddGroup
+	inputAddTask
+	inputAddSubtask
+	inputRenameWorkspace
+	inputRenameGroup
+	inputRenameTask
+	inputRenameTaskTitle
+	inputEditDescription
+	inputGitRemote
+)
+
+// ─── MODEL ───
+
 type model struct {
-	state       AppState
-	cursor      int // Task cursor (in the VISIBLE list)
-	groupCursor int // Group cursor
-	input       textinput.Model
+	state     sessionState
+	prevState sessionState // for git menu return
 
-	mode        sessionState
-	compactMode bool
+	workspaces       []string
+	workspaceCursor  int
+	currentWorkspace string
 
-	// Input/Confirmation State
-	adding     bool
-	renameType int // 0: Group, 1: Task
+	groups       []string
+	groupCursor  int
+	currentGroup string
+
+	tasks      GroupFile
+	taskCursor int
+
+	subtaskCursor int
+
+	// Git
+	gitMenuCursor int
+	gitOutput     string
+	gitItems      []string
+
+	// All view collapse
+	collapsed    map[string]bool
+	allViewItems []allViewEntry // computed for navigation
+
+	// Input
+	input         textinput.Model
+	inputMode     inputTarget
+	adding        bool
+	confirmDelete bool
 
 	quitting bool
-	err      error
 	width    int
 	height   int
 }
 
-// --- STYLING & COLORS ---
+type allViewEntry struct {
+	isHeader  bool
+	groupName string
+	taskIndex int // index within that group's Todos
+}
+
+// ─── STYLING ───
 
 var (
-	// Expanded Palette (20+ colors)
 	palette = []lipgloss.Color{
-		lipgloss.Color("#FFB6C1"), // LightPink
-		lipgloss.Color("#87CEFA"), // LightSkyBlue
-		lipgloss.Color("#90EE90"), // LightGreen
-		lipgloss.Color("#FFD700"), // Gold
-		lipgloss.Color("#FFA07A"), // LightSalmon
-		lipgloss.Color("#DDA0DD"), // Plum
-		lipgloss.Color("#F0E68C"), // Khaki
-		lipgloss.Color("#00CED1"), // DarkTurquoise
-		lipgloss.Color("#FF69B4"), // HotPink
-		lipgloss.Color("#6495ED"), // CornflowerBlue
-		lipgloss.Color("#32CD32"), // LimeGreen
-		lipgloss.Color("#FF4500"), // OrangeRed
-		lipgloss.Color("#BA55D3"), // MediumOrchid
-		lipgloss.Color("#00FA9A"), // MediumSpringGreen
-		lipgloss.Color("#4169E1"), // RoyalBlue
-		lipgloss.Color("#DC143C"), // Crimson
-		lipgloss.Color("#00BFFF"), // DeepSkyBlue
-		lipgloss.Color("#9370DB"), // MediumPurple
-		lipgloss.Color("#3CB371"), // MediumSeaGreen
-		lipgloss.Color("#FF6347"), // Tomato
+		"#FFB6C1", "#87CEFA", "#90EE90", "#FFD700", "#FFA07A",
+		"#DDA0DD", "#F0E68C", "#00CED1", "#FF69B4", "#6495ED",
+		"#32CD32", "#FF4500", "#BA55D3", "#00FA9A", "#4169E1",
+		"#DC143C", "#00BFFF", "#9370DB", "#3CB371", "#FF6347",
 	}
 
 	appStyle = lipgloss.NewStyle().
@@ -94,120 +138,292 @@ var (
 			Background(lipgloss.Color("62")).
 			Padding(0, 1).
 			Bold(true)
+
+	faintStyle = lipgloss.NewStyle().Faint(true)
+	boldStyle  = lipgloss.NewStyle().Bold(true)
 )
 
-// Get deterministic color for a group based on its index
-func getGroupColor(index int) lipgloss.Color {
-	if index == 0 {
-		return lipgloss.Color("250") // Light Gray for Default Group (Index 0)
+func getColor(index int) lipgloss.Color {
+	if index <= 0 {
+		return lipgloss.Color("250")
 	}
-	if index < 0 {
-		return lipgloss.Color("255") // Fallback White (shouldn't happen)
-	}
-	return palette[index%len(palette)]
+	return palette[(index-1)%len(palette)]
 }
 
-// Find group index by name (helper for coloring)
-func (s AppState) getGroupIndex(name string) int {
-	for i, g := range s.Groups {
-		if g == name {
-			return i
-		}
+// ─── PERSISTENCE ───
+
+func getDataDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "todo_data"
 	}
-	return 0 // Default to 0 if not found
+	return filepath.Join(filepath.Dir(exe), "todo_data")
 }
 
-// --- PERSISTENCE ---
-
-func getTodoPath() (string, error) {
-	configDir, err := os.UserConfigDir()
+func getBackupDir() string {
+	cfg, err := os.UserConfigDir()
 	if err != nil {
-		return "", err
+		return ""
 	}
-	todoDir := filepath.Join(configDir, "todotui")
-	if err := os.MkdirAll(todoDir, 0755); err != nil {
-		return "", err
-	}
-	return filepath.Join(todoDir, "todos.json"), nil
+	return filepath.Join(cfg, "todotui", "backup")
 }
 
-func loadTodos() AppState {
-	defaultState := AppState{
-		Todos:     []Todo{},
-		Groups:    []string{"All"}, // Rename "General" to "All" or user preference. Index 0 is Aggregator.
-		LastGroup: "All",
+func ensureDir(path string) {
+	_ = os.MkdirAll(path, 0755)
+}
+
+func loadWorkspaces() []string {
+	dir := getDataDir()
+	ensureDir(dir)
+	// Ensure HOME always exists
+	ensureDir(filepath.Join(dir, "HOME"))
+	// Ensure HOME/ALL.json exists
+	allPath := filepath.Join(dir, "HOME", "ALL.json")
+	if _, err := os.Stat(allPath); os.IsNotExist(err) {
+		g := GroupFile{Title: "ALL", Todos: []Todo{}}
+		data, _ := json.MarshalIndent(g, "", "  ")
+		_ = os.WriteFile(allPath, data, 0644)
 	}
 
-	path, err := getTodoPath()
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return defaultState
+		return []string{"HOME"}
 	}
 
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return defaultState
+	ws := []string{}
+	hasHome := false
+	for _, e := range entries {
+		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			name := strings.ToUpper(e.Name())
+			if name == "HOME" {
+				hasHome = true
+			}
+			ws = append(ws, name)
+		}
 	}
-
-	var state AppState
-	// Try AppState (New Format)
-	if err := json.Unmarshal(data, &state); err == nil {
-		if len(state.Groups) == 0 {
-			state.Groups = []string{"All"}
-		}
-		if state.LastGroup == "" { // keep basic sanitization, though we ignore it for view mode
-			state.LastGroup = state.Groups[0]
-		}
-		// Ensure tasks map to valid groups (or default to Index 0)
-		for i := range state.Todos {
-			if state.Todos[i].Group == "" {
-				state.Todos[i].Group = state.Groups[0]
+	if !hasHome {
+		ws = append([]string{"HOME"}, ws...)
+	} else {
+		// Ensure HOME is at index 0
+		sorted := []string{"HOME"}
+		for _, w := range ws {
+			if w != "HOME" {
+				sorted = append(sorted, w)
 			}
 		}
-		return state
+		ws = sorted
 	}
-
-	// Fallback/Migration logic
-	var oldTodos []Todo
-	if err := json.Unmarshal(data, &oldTodos); err == nil {
-		for i := range oldTodos {
-			oldTodos[i].Group = "All"
-		}
-		return AppState{
-			Todos:     oldTodos,
-			Groups:    []string{"All"},
-			LastGroup: "All",
-		}
-	}
-
-	return defaultState
+	return ws
 }
 
-func saveTodos(state AppState) {
-	path, err := getTodoPath()
+func loadGroups(workspace string) []string {
+	dir := filepath.Join(getDataDir(), workspace)
+	ensureDir(dir)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if workspace == "HOME" {
+			return []string{"ALL"}
+		}
+		return []string{}
+	}
+
+	groups := []string{}
+	hasAll := false
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
+			name := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+			if workspace == "HOME" && strings.ToUpper(name) == "ALL" {
+				hasAll = true
+				groups = append(groups, "ALL")
+			} else {
+				groups = append(groups, name)
+			}
+		}
+	}
+
+	if workspace == "HOME" && !hasAll {
+		groups = append([]string{"ALL"}, groups...)
+		// Create the file
+		g := GroupFile{Title: "ALL", Todos: []Todo{}}
+		data, _ := json.MarshalIndent(g, "", "  ")
+		_ = os.WriteFile(filepath.Join(dir, "ALL.json"), data, 0644)
+	} else if workspace == "HOME" {
+		// Ensure ALL is at index 0
+		sorted := []string{"ALL"}
+		for _, g := range groups {
+			if g != "ALL" {
+				sorted = append(sorted, g)
+			}
+		}
+		groups = sorted
+	}
+	return groups
+}
+
+func loadGroupFile(workspace, group string) GroupFile {
+	path := filepath.Join(getDataDir(), workspace, group+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return GroupFile{Title: group, Todos: []Todo{}}
+	}
+	var gf GroupFile
+	if err := json.Unmarshal(data, &gf); err != nil {
+		return GroupFile{Title: group, Todos: []Todo{}}
+	}
+	return gf
+}
+
+func saveGroupFile(workspace, group string, gf GroupFile) {
+	primary := filepath.Join(getDataDir(), workspace)
+	ensureDir(primary)
+	data, err := json.MarshalIndent(gf, "", "  ")
 	if err != nil {
 		return
 	}
-	data, err := json.MarshalIndent(state, "", "  ")
+	_ = os.WriteFile(filepath.Join(primary, group+".json"), data, 0644)
+
+	// Backup
+	backup := getBackupDir()
+	if backup != "" {
+		bDir := filepath.Join(backup, workspace)
+		ensureDir(bDir)
+		_ = os.WriteFile(filepath.Join(bDir, group+".json"), data, 0644)
+	}
+}
+
+func deleteGroupFile(workspace, group string) {
+	_ = os.Remove(filepath.Join(getDataDir(), workspace, group+".json"))
+	backup := getBackupDir()
+	if backup != "" {
+		_ = os.Remove(filepath.Join(backup, workspace, group+".json"))
+	}
+}
+
+func createWorkspace(name string) {
+	name = strings.ToUpper(name)
+	ensureDir(filepath.Join(getDataDir(), name))
+	backup := getBackupDir()
+	if backup != "" {
+		ensureDir(filepath.Join(backup, name))
+	}
+}
+
+func deleteWorkspace(name string) {
+	_ = os.RemoveAll(filepath.Join(getDataDir(), name))
+	backup := getBackupDir()
+	if backup != "" {
+		_ = os.RemoveAll(filepath.Join(backup, name))
+	}
+}
+
+func countGroupTasks(workspace, group string) (done, total int) {
+	gf := loadGroupFile(workspace, group)
+	total = len(gf.Todos)
+	for _, t := range gf.Todos {
+		if t.Done {
+			done++
+		}
+	}
+	return
+}
+
+func countWorkspaceTasks(workspace string) (done, total int) {
+	groups := loadGroups(workspace)
+	for _, g := range groups {
+		d, t := countGroupTasks(workspace, g)
+		done += d
+		total += t
+	}
+	return
+}
+
+// ─── MIGRATION ───
+
+func migrateOldData() {
+	cfg, err := os.UserConfigDir()
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, data, 0644)
+	oldPath := filepath.Join(cfg, "todotui", "todos.json")
+	data, err := os.ReadFile(oldPath)
+	if err != nil {
+		return
+	}
+
+	// Try new format first
+	var oldState OldAppState
+	if err := json.Unmarshal(data, &oldState); err != nil {
+		return
+	}
+	if len(oldState.Todos) == 0 && len(oldState.Groups) == 0 {
+		return
+	}
+
+	// Group tasks by their group name
+	grouped := map[string][]Todo{}
+	for _, ot := range oldState.Todos {
+		g := ot.Group
+		if g == "" || g == "All" {
+			g = "ALL"
+		}
+		grouped[g] = append(grouped[g], Todo{
+			Title: ot.Title,
+			Done:  ot.Done,
+		})
+	}
+
+	// Also create empty groups that existed
+	for _, gName := range oldState.Groups {
+		if gName == "" || gName == "All" {
+			gName = "ALL"
+		}
+		if _, ok := grouped[gName]; !ok {
+			grouped[gName] = []Todo{}
+		}
+	}
+
+	// Write to HOME workspace
+	for gName, todos := range grouped {
+		gf := GroupFile{Title: gName, Todos: todos}
+		saveGroupFile("HOME", gName, gf)
+	}
+
+	// Rename old file
+	_ = os.Rename(oldPath, oldPath+".migrated")
 }
 
-// --- INIT ---
+// ─── GIT HELPERS ───
+
+func runGitCmd(args ...string) string {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = getDataDir()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out) + "\n" + err.Error()
+	}
+	return string(out)
+}
+
+// ─── INIT ───
 
 func initialModel() model {
-	state := loadTodos()
+	migrateOldData()
+
 	ti := textinput.New()
-	ti.Placeholder = "New task..."
+	ti.Placeholder = "..."
 	ti.Focus()
 	ti.Prompt = ""
 
+	ws := loadWorkspaces()
+
 	return model{
-		state:       state,
-		input:       ti,
-		mode:        viewGroups, // FORCE START IN GROUP VIEW
-		compactMode: false,
+		state:            stateViewWorkspaces,
+		workspaces:       ws,
+		currentWorkspace: "HOME",
+		input:            ti,
+		gitItems:         []string{"Status", "Sync (Pull/Push)", "Commit", "Configure Remote"},
+		collapsed:        make(map[string]bool),
 	}
 }
 
@@ -215,308 +431,529 @@ func (m model) Init() tea.Cmd {
 	return tea.EnterAltScreen
 }
 
-// --- HELPER: SORTING & FILTERING ---
+// ─── ALL VIEW HELPERS ───
 
-// Returns a sorted list of INDICES into m.state.Todos
-// Filtered by current group (or All)
-// Sorted by Done status (Active first)
-func (m model) getVisibleTasks() []int {
-	var visible []int
-	isAll := (m.state.LastGroup == m.state.Groups[0])
-
-	for i, t := range m.state.Todos {
-		if isAll || t.Group == m.state.LastGroup {
-			visible = append(visible, i)
+func (m *model) buildAllViewItems() {
+	m.allViewItems = nil
+	groups := loadGroups(m.currentWorkspace)
+	for _, gName := range groups {
+		if gName == "ALL" {
+			continue
+		}
+		gf := loadGroupFile(m.currentWorkspace, gName)
+		m.allViewItems = append(m.allViewItems, allViewEntry{isHeader: true, groupName: gName})
+		if !m.collapsed[gName] {
+			for i := range gf.Todos {
+				m.allViewItems = append(m.allViewItems, allViewEntry{groupName: gName, taskIndex: i})
+			}
 		}
 	}
-
-	// STABLE SORT: Active (!Done) before Done
-	sort.SliceStable(visible, func(i, j int) bool {
-		t1 := m.state.Todos[visible[i]]
-		t2 := m.state.Todos[visible[j]]
-
-		if t1.Done != t2.Done {
-			return !t1.Done // If t1 is not done (true), it comes before t2 (false)
-		}
-		return false // Maintain original order otherwise
-	})
-
-	return visible
 }
 
-// --- UPDATE ---
+// ─── UPDATE ───
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.quitting {
 		return m, tea.Quit
 	}
-
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		return m, nil
 
 	case tea.KeyMsg:
-		// 1. INPUT HANDLING (Adding / Renaming)
-		if m.adding || m.mode == renaming {
-			switch msg.Type {
-			case tea.KeyEnter:
-				val := m.input.Value()
-				if val != "" {
-					if m.mode == renaming {
-						// RENAME LOGIC
-						if m.renameType == 0 { // Group
-							oldName := m.state.Groups[m.groupCursor]
-							m.state.Groups[m.groupCursor] = val
-							// Update Tasks
-							for i := range m.state.Todos {
-								if m.state.Todos[i].Group == oldName {
-									m.state.Todos[i].Group = val
-								}
-							}
-							if m.state.LastGroup == oldName {
-								m.state.LastGroup = val
-							}
-							m.mode = viewGroups
-						} else { // Task
-							visible := m.getVisibleTasks()
-							if m.cursor < len(visible) {
-								realIdx := visible[m.cursor]
-								m.state.Todos[realIdx].Title = val
-							}
-							m.mode = viewTasks
-						}
-					} else { // Adding
-						// ADD LOGIC
-						if m.mode == viewGroups {
-							// Add Group
-							m.state.Groups = append(m.state.Groups, val)
-							m.state.LastGroup = val
-							m.mode = viewTasks // Auto-enter new group? Sure.
-							m.cursor = 0
-						} else {
-							// Add Task
-							targetGroup := m.state.LastGroup
-							// If in "All" view (Index 0), assign to "All" (Index 0)
-							// Actually, LastGroup == m.state.Groups[0] already handles this.
-							m.state.Todos = append(m.state.Todos, Todo{Title: val, Done: false, Group: targetGroup})
-						}
-						m.adding = false
-					}
-					saveTodos(m.state)
-					m.input.Reset()
-				} else {
-					// Empty input cancels
-					m.adding = false
-					if m.mode == renaming {
-						if m.renameType == 0 {
-							m.mode = viewGroups
-						} else {
-							m.mode = viewTasks
-						}
-					}
-				}
-				return m, nil
-
-			case tea.KeyEsc:
-				m.adding = false
-				m.input.Reset()
-				if m.mode == renaming {
-					if m.renameType == 0 {
-						m.mode = viewGroups
-					} else {
-						m.mode = viewTasks
-					}
-				}
-				return m, nil
-			}
-			m.input, cmd = m.input.Update(msg)
-			return m, cmd
+		// ── INPUT MODE ──
+		if m.inputMode != inputNone {
+			return m.handleInput(msg)
 		}
-
-		// 2. CONFIRMATION (Deletion)
-		if m.mode == deletingGroup {
-			switch msg.String() {
-			case "ctrl+x":
-				targetGroup := m.state.Groups[m.groupCursor]
-				// Cascade delete tasks
-				newTodos := []Todo{}
-				for _, t := range m.state.Todos {
-					if t.Group != targetGroup {
-						newTodos = append(newTodos, t)
-					}
-				}
-				m.state.Todos = newTodos
-				// Delete group
-				m.state.Groups = append(m.state.Groups[:m.groupCursor], m.state.Groups[m.groupCursor+1:]...)
-				// Reset navigation
-				if m.groupCursor >= len(m.state.Groups) {
-					m.groupCursor = len(m.state.Groups) - 1
-				}
-				if len(m.state.Groups) > 0 {
-					m.state.LastGroup = m.state.Groups[0]
-				}
-				m.mode = viewGroups
-				saveTodos(m.state)
-				return m, nil
-			case "n", "esc":
-				m.mode = viewGroups
-				return m, nil
-			}
-			return m, nil
+		// ── CONFIRM DELETE ──
+		if m.confirmDelete {
+			return m.handleConfirmDelete(msg)
 		}
-
-		// 3. NAVIGATION & COMMANDS
+		// ── GIT MENU ──
+		if m.state == stateGitMenu {
+			return m.handleGitMenu(msg)
+		}
+		// ── TASK DETAILS ──
+		if m.state == stateTaskDetails {
+			return m.handleTaskDetails(msg)
+		}
+		// ── GLOBAL KEYS ──
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
-
-		case "tab":
-			m.compactMode = !m.compactMode
-			if m.compactMode {
-				return m, tea.ExitAltScreen
-			}
-			return m, tea.EnterAltScreen
-
-		// ARROWS / VI KEYS
-		case "up", "k":
-			if m.mode == viewGroups {
-				if m.groupCursor > 0 {
-					m.groupCursor--
-				}
-			} else {
-				if m.cursor > 0 {
-					m.cursor--
-				}
-			}
-		case "down", "j":
-			if m.mode == viewGroups {
-				if m.groupCursor < len(m.state.Groups)-1 {
-					m.groupCursor++
-				}
-			} else {
-				visibleCount := len(m.getVisibleTasks()) // This is slightly expensive to recalc, but safe for TUI sizes
-				if m.cursor < visibleCount-1 {
-					m.cursor++
-				}
-			}
-		case "left", "h":
-			m.mode = viewGroups
-		case "right", "l":
-			if m.mode == viewGroups {
-				// Enter group
-				m.state.LastGroup = m.state.Groups[m.groupCursor]
-				m.mode = viewTasks
-				m.cursor = 0
-			}
-			// In viewTasks, right does nothing or stays
-
-		case " ":
-			// Toggle Done
-			if m.mode == viewTasks {
-				visible := m.getVisibleTasks()
-				if m.cursor < len(visible) {
-					realIdx := visible[m.cursor]
-					m.state.Todos[realIdx].Done = !m.state.Todos[realIdx].Done
-					saveTodos(m.state)
-				}
-			}
-
-		case "enter":
-			if m.mode == viewGroups {
-				m.state.LastGroup = m.state.Groups[m.groupCursor]
-				m.mode = viewTasks
-				m.cursor = 0
-			} else {
-				// ViewTasks: Toggle on Enter too?
-				visible := m.getVisibleTasks()
-				if m.cursor < len(visible) {
-					realIdx := visible[m.cursor]
-					m.state.Todos[realIdx].Done = !m.state.Todos[realIdx].Done
-					saveTodos(m.state)
-				}
-			}
-
-		case "n":
-			m.adding = true
-			m.input.Placeholder = "New..."
-			if m.mode == viewGroups {
-				m.input.Placeholder = "New Group..."
-			}
-			m.input.Focus()
-			return m, textinput.Blink
-
-		case "r":
-			if m.mode == viewGroups {
-				m.renameType = 0
-				m.input.SetValue(m.state.Groups[m.groupCursor])
-				m.mode = renaming
-			} else if m.mode == viewTasks {
-				m.renameType = 1
-				visible := m.getVisibleTasks()
-				if m.cursor < len(visible) {
-					realIdx := visible[m.cursor]
-					m.input.SetValue(m.state.Todos[realIdx].Title)
-					m.mode = renaming
-				}
-			}
-			// Only focus if we actually entered renaming mode?
-			// Check if we set mode to renaming?
-			if m.mode == renaming {
-				m.input.Focus()
-				return m, textinput.Blink
-			}
-
-		case "x":
-			if m.mode == viewGroups {
-				// Group Deletion
-				if m.groupCursor == 0 {
-					return m, nil
-				} // Protected Index 0
-
-				// Check for content
-				hasTasks := false
-				target := m.state.Groups[m.groupCursor]
-				for _, t := range m.state.Todos {
-					if t.Group == target {
-						hasTasks = true
-						break
-					}
-				}
-				if hasTasks {
-					m.mode = deletingGroup
-				} else {
-					// Empty? Delete now
-					m.state.Groups = append(m.state.Groups[:m.groupCursor], m.state.Groups[m.groupCursor+1:]...)
-					if m.groupCursor >= len(m.state.Groups) {
-						m.groupCursor = len(m.state.Groups) - 1
-					}
-					saveTodos(m.state)
-				}
-			} else {
-				// Task Deletion: Global Delete in "All" too
-				visible := m.getVisibleTasks()
-				if m.cursor < len(visible) {
-					realIdx := visible[m.cursor]
-					// Remove from slice
-					m.state.Todos = append(m.state.Todos[:realIdx], m.state.Todos[realIdx+1:]...)
-
-					// Cursor fix: if we delete the last item, move cursor up
-					if m.cursor >= len(visible)-1 && m.cursor > 0 {
-						m.cursor--
-					}
-					saveTodos(m.state)
-				}
-			}
+		case "g":
+			m.prevState = m.state
+			m.state = stateGitMenu
+			m.gitMenuCursor = 0
+			m.gitOutput = ""
+			return m, nil
+		}
+		// ── STATE-SPECIFIC ──
+		switch m.state {
+		case stateViewWorkspaces:
+			return m.handleWorkspaces(msg)
+		case stateViewGroups:
+			return m.handleGroups(msg)
+		case stateViewTasks:
+			return m.handleTasks(msg)
 		}
 	}
 	return m, cmd
 }
 
-// --- VIEW ---
+// ── INPUT HANDLER ──
+
+func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		val := strings.TrimSpace(m.input.Value())
+		if val != "" {
+			switch m.inputMode {
+			case inputAddWorkspace:
+				name := strings.ToUpper(val)
+				createWorkspace(name)
+				m.workspaces = loadWorkspaces()
+			case inputAddGroup:
+				gf := GroupFile{Title: val, Todos: []Todo{}}
+				saveGroupFile(m.currentWorkspace, val, gf)
+				m.groups = loadGroups(m.currentWorkspace)
+			case inputAddTask:
+				m.tasks.Todos = append(m.tasks.Todos, Todo{Title: val})
+				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+			case inputAddSubtask:
+				if m.taskCursor < len(m.tasks.Todos) {
+					m.tasks.Todos[m.taskCursor].Subtasks = append(m.tasks.Todos[m.taskCursor].Subtasks, Subtask{Title: val})
+					saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+				}
+			case inputRenameWorkspace:
+				if m.workspaceCursor > 0 && m.workspaceCursor < len(m.workspaces) {
+					oldName := m.workspaces[m.workspaceCursor]
+					newName := strings.ToUpper(val)
+					oldPath := filepath.Join(getDataDir(), oldName)
+					newPath := filepath.Join(getDataDir(), newName)
+					_ = os.Rename(oldPath, newPath)
+					m.workspaces = loadWorkspaces()
+				}
+			case inputRenameGroup:
+				if m.groupCursor < len(m.groups) {
+					oldName := m.groups[m.groupCursor]
+					if !(m.currentWorkspace == "HOME" && oldName == "ALL") {
+						gf := loadGroupFile(m.currentWorkspace, oldName)
+						gf.Title = val
+						saveGroupFile(m.currentWorkspace, val, gf)
+						deleteGroupFile(m.currentWorkspace, oldName)
+						m.groups = loadGroups(m.currentWorkspace)
+					}
+				}
+			case inputRenameTask, inputRenameTaskTitle:
+				if m.taskCursor < len(m.tasks.Todos) {
+					m.tasks.Todos[m.taskCursor].Title = val
+					saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+				}
+			case inputEditDescription:
+				if m.taskCursor < len(m.tasks.Todos) {
+					m.tasks.Todos[m.taskCursor].Description = val
+					saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+				}
+			case inputGitRemote:
+				runGitCmd("remote", "add", "origin", val)
+				m.gitOutput = "Remote added: " + val
+			}
+		}
+		m.inputMode = inputNone
+		m.input.Reset()
+		return m, nil
+
+	case tea.KeyEsc:
+		m.inputMode = inputNone
+		m.input.Reset()
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// ── CONFIRM DELETE ──
+
+func (m model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+x":
+		switch m.state {
+		case stateViewWorkspaces:
+			if m.workspaceCursor > 0 {
+				deleteWorkspace(m.workspaces[m.workspaceCursor])
+				m.workspaces = loadWorkspaces()
+				if m.workspaceCursor >= len(m.workspaces) {
+					m.workspaceCursor = len(m.workspaces) - 1
+				}
+			}
+		case stateViewGroups:
+			if m.groupCursor < len(m.groups) {
+				name := m.groups[m.groupCursor]
+				if !(m.currentWorkspace == "HOME" && name == "ALL") {
+					deleteGroupFile(m.currentWorkspace, name)
+					m.groups = loadGroups(m.currentWorkspace)
+					if m.groupCursor >= len(m.groups) {
+						m.groupCursor = len(m.groups) - 1
+					}
+				}
+			}
+		case stateViewTasks:
+			if m.taskCursor < len(m.tasks.Todos) {
+				m.tasks.Todos = append(m.tasks.Todos[:m.taskCursor], m.tasks.Todos[m.taskCursor+1:]...)
+				if m.taskCursor >= len(m.tasks.Todos) && m.taskCursor > 0 {
+					m.taskCursor--
+				}
+				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+			}
+		}
+		m.confirmDelete = false
+	case "n", "esc":
+		m.confirmDelete = false
+	}
+	return m, nil
+}
+
+// ── GIT MENU ──
+
+func (m model) handleGitMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.state = m.prevState
+		return m, nil
+	case "up", "k":
+		if m.gitMenuCursor > 0 {
+			m.gitMenuCursor--
+		}
+	case "down", "j":
+		if m.gitMenuCursor < len(m.gitItems)-1 {
+			m.gitMenuCursor++
+		}
+	case "enter":
+		switch m.gitMenuCursor {
+		case 0: // Status
+			m.gitOutput = runGitCmd("status")
+		case 1: // Sync
+			out := runGitCmd("pull")
+			out += "\n" + runGitCmd("push")
+			m.gitOutput = out
+		case 2: // Commit
+			runGitCmd("add", ".")
+			ts := time.Now().Format("2006-01-02 15:04:05")
+			m.gitOutput = runGitCmd("commit", "-m", "Auto-update "+ts)
+		case 3: // Configure Remote
+			m.inputMode = inputGitRemote
+			m.input.Placeholder = "Remote URL..."
+			m.input.Reset()
+			m.input.Focus()
+			return m, textinput.Blink
+		}
+	}
+	return m, nil
+}
+
+// ── WORKSPACE HANDLER ──
+
+func (m model) handleWorkspaces(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		if m.workspaceCursor > 0 {
+			m.workspaceCursor--
+		}
+	case "down", "j":
+		if m.workspaceCursor < len(m.workspaces)-1 {
+			m.workspaceCursor++
+		}
+	case "enter", "right", "l":
+		if m.workspaceCursor < len(m.workspaces) {
+			m.currentWorkspace = m.workspaces[m.workspaceCursor]
+			m.groups = loadGroups(m.currentWorkspace)
+			m.groupCursor = 0
+			m.state = stateViewGroups
+		}
+	case "n":
+		m.inputMode = inputAddWorkspace
+		m.input.Placeholder = "New Workspace (UPPERCASE)..."
+		m.input.Reset()
+		m.input.Focus()
+		return m, textinput.Blink
+	case "r":
+		if m.workspaceCursor > 0 {
+			m.inputMode = inputRenameWorkspace
+			m.input.SetValue(m.workspaces[m.workspaceCursor])
+			m.input.Focus()
+			return m, textinput.Blink
+		}
+	case "x":
+		if m.workspaceCursor > 0 {
+			m.confirmDelete = true
+		}
+	case "shift+up", "K":
+		if m.workspaceCursor > 1 {
+			m.workspaces[m.workspaceCursor], m.workspaces[m.workspaceCursor-1] = m.workspaces[m.workspaceCursor-1], m.workspaces[m.workspaceCursor]
+			m.workspaceCursor--
+		}
+	case "shift+down", "J":
+		if m.workspaceCursor > 0 && m.workspaceCursor < len(m.workspaces)-1 {
+			m.workspaces[m.workspaceCursor], m.workspaces[m.workspaceCursor+1] = m.workspaces[m.workspaceCursor+1], m.workspaces[m.workspaceCursor]
+			m.workspaceCursor++
+		}
+	}
+	return m, nil
+}
+
+// ── GROUP HANDLER ──
+
+func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "left", "h":
+		m.workspaces = loadWorkspaces()
+		m.state = stateViewWorkspaces
+	case "up", "k":
+		if m.groupCursor > 0 {
+			m.groupCursor--
+		}
+	case "down", "j":
+		if m.groupCursor < len(m.groups)-1 {
+			m.groupCursor++
+		}
+	case "enter", "right", "l":
+		if m.groupCursor < len(m.groups) {
+			m.currentGroup = m.groups[m.groupCursor]
+			if m.currentWorkspace == "HOME" && m.currentGroup == "ALL" {
+				// ALL view: build aggregated items
+				m.buildAllViewItems()
+			}
+			m.tasks = loadGroupFile(m.currentWorkspace, m.currentGroup)
+			m.taskCursor = 0
+			m.state = stateViewTasks
+		}
+	case "n":
+		m.inputMode = inputAddGroup
+		m.input.Placeholder = "New Group..."
+		m.input.Reset()
+		m.input.Focus()
+		return m, textinput.Blink
+	case "r":
+		if !(m.currentWorkspace == "HOME" && m.groupCursor == 0) {
+			m.inputMode = inputRenameGroup
+			m.input.SetValue(m.groups[m.groupCursor])
+			m.input.Focus()
+			return m, textinput.Blink
+		}
+	case "x":
+		if !(m.currentWorkspace == "HOME" && m.groupCursor == 0) && m.groupCursor < len(m.groups) {
+			m.confirmDelete = true
+		}
+	case "shift+up", "K":
+		minIdx := 0
+		if m.currentWorkspace == "HOME" {
+			minIdx = 1
+		}
+		if m.groupCursor > minIdx {
+			// Rename files to swap order: we store order by filesystem, so we track by reloading
+			m.groups[m.groupCursor], m.groups[m.groupCursor-1] = m.groups[m.groupCursor-1], m.groups[m.groupCursor]
+			m.groupCursor--
+		}
+	case "shift+down", "J":
+		minIdx := 0
+		if m.currentWorkspace == "HOME" {
+			minIdx = 1
+		}
+		if m.groupCursor >= minIdx && m.groupCursor < len(m.groups)-1 {
+			m.groups[m.groupCursor], m.groups[m.groupCursor+1] = m.groups[m.groupCursor+1], m.groups[m.groupCursor]
+			m.groupCursor++
+		}
+	}
+	return m, nil
+}
+
+// ── TASK HANDLER ──
+
+func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	isAllView := m.currentWorkspace == "HOME" && m.currentGroup == "ALL"
+
+	if isAllView {
+		return m.handleAllViewTasks(msg)
+	}
+
+	switch msg.String() {
+	case "esc", "left", "h":
+		m.groups = loadGroups(m.currentWorkspace)
+		m.state = stateViewGroups
+	case "up", "k":
+		if m.taskCursor > 0 {
+			m.taskCursor--
+		}
+	case "down", "j":
+		if m.taskCursor < len(m.tasks.Todos)-1 {
+			m.taskCursor++
+		}
+	case " ":
+		if m.taskCursor < len(m.tasks.Todos) {
+			m.tasks.Todos[m.taskCursor].Done = !m.tasks.Todos[m.taskCursor].Done
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
+	case "enter":
+		if m.taskCursor < len(m.tasks.Todos) {
+			m.subtaskCursor = 0
+			m.state = stateTaskDetails
+		}
+	case "n":
+		m.inputMode = inputAddTask
+		m.input.Placeholder = "New Task..."
+		m.input.Reset()
+		m.input.Focus()
+		return m, textinput.Blink
+	case "r":
+		if m.taskCursor < len(m.tasks.Todos) {
+			m.inputMode = inputRenameTask
+			m.input.SetValue(m.tasks.Todos[m.taskCursor].Title)
+			m.input.Focus()
+			return m, textinput.Blink
+		}
+	case "x":
+		if m.taskCursor < len(m.tasks.Todos) {
+			m.tasks.Todos = append(m.tasks.Todos[:m.taskCursor], m.tasks.Todos[m.taskCursor+1:]...)
+			if m.taskCursor >= len(m.tasks.Todos) && m.taskCursor > 0 {
+				m.taskCursor--
+			}
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
+	case "shift+up", "K":
+		if m.taskCursor > 0 {
+			m.tasks.Todos[m.taskCursor], m.tasks.Todos[m.taskCursor-1] = m.tasks.Todos[m.taskCursor-1], m.tasks.Todos[m.taskCursor]
+			m.taskCursor--
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
+	case "shift+down", "J":
+		if m.taskCursor < len(m.tasks.Todos)-1 {
+			m.tasks.Todos[m.taskCursor], m.tasks.Todos[m.taskCursor+1] = m.tasks.Todos[m.taskCursor+1], m.tasks.Todos[m.taskCursor]
+			m.taskCursor++
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
+	}
+	return m, nil
+}
+
+// ── ALL VIEW TASK HANDLER ──
+
+func (m model) handleAllViewTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "left", "h":
+		m.groups = loadGroups(m.currentWorkspace)
+		m.state = stateViewGroups
+	case "up", "k":
+		if m.taskCursor > 0 {
+			m.taskCursor--
+		}
+	case "down", "j":
+		if m.taskCursor < len(m.allViewItems)-1 {
+			m.taskCursor++
+		}
+	case "tab", " ":
+		if m.taskCursor < len(m.allViewItems) {
+			entry := m.allViewItems[m.taskCursor]
+			if entry.isHeader {
+				m.collapsed[entry.groupName] = !m.collapsed[entry.groupName]
+				m.buildAllViewItems()
+				if m.taskCursor >= len(m.allViewItems) {
+					m.taskCursor = len(m.allViewItems) - 1
+				}
+			} else {
+				// Toggle done
+				gf := loadGroupFile(m.currentWorkspace, entry.groupName)
+				if entry.taskIndex < len(gf.Todos) {
+					gf.Todos[entry.taskIndex].Done = !gf.Todos[entry.taskIndex].Done
+					saveGroupFile(m.currentWorkspace, entry.groupName, gf)
+					m.buildAllViewItems()
+				}
+			}
+		}
+	case "enter":
+		if m.taskCursor < len(m.allViewItems) {
+			entry := m.allViewItems[m.taskCursor]
+			if entry.isHeader {
+				m.collapsed[entry.groupName] = !m.collapsed[entry.groupName]
+				m.buildAllViewItems()
+			}
+		}
+	}
+	return m, nil
+}
+
+// ── TASK DETAILS HANDLER ──
+
+func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.taskCursor >= len(m.tasks.Todos) {
+		m.state = stateViewTasks
+		return m, nil
+	}
+	task := &m.tasks.Todos[m.taskCursor]
+
+	switch msg.String() {
+	case "esc":
+		m.state = stateViewTasks
+	case "up", "k":
+		if m.subtaskCursor > 0 {
+			m.subtaskCursor--
+		}
+	case "down", "j":
+		if m.subtaskCursor < len(task.Subtasks)-1 {
+			m.subtaskCursor++
+		}
+	case " ", "enter":
+		if m.subtaskCursor < len(task.Subtasks) {
+			task.Subtasks[m.subtaskCursor].Done = !task.Subtasks[m.subtaskCursor].Done
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
+	case "n":
+		m.inputMode = inputAddSubtask
+		m.input.Placeholder = "New Subtask..."
+		m.input.Reset()
+		m.input.Focus()
+		return m, textinput.Blink
+	case "r":
+		m.inputMode = inputRenameTaskTitle
+		m.input.SetValue(task.Title)
+		m.input.Focus()
+		return m, textinput.Blink
+	case "d":
+		m.inputMode = inputEditDescription
+		m.input.SetValue(task.Description)
+		m.input.Focus()
+		return m, textinput.Blink
+	case "x":
+		if m.subtaskCursor < len(task.Subtasks) {
+			task.Subtasks = append(task.Subtasks[:m.subtaskCursor], task.Subtasks[m.subtaskCursor+1:]...)
+			if m.subtaskCursor >= len(task.Subtasks) && m.subtaskCursor > 0 {
+				m.subtaskCursor--
+			}
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
+	case "shift+up", "K":
+		if m.subtaskCursor > 0 {
+			task.Subtasks[m.subtaskCursor], task.Subtasks[m.subtaskCursor-1] = task.Subtasks[m.subtaskCursor-1], task.Subtasks[m.subtaskCursor]
+			m.subtaskCursor--
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
+	case "shift+down", "J":
+		if m.subtaskCursor < len(task.Subtasks)-1 {
+			task.Subtasks[m.subtaskCursor], task.Subtasks[m.subtaskCursor+1] = task.Subtasks[m.subtaskCursor+1], task.Subtasks[m.subtaskCursor]
+			m.subtaskCursor++
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
+	}
+	return m, nil
+}
+
+// ─── VIEW ───
 
 func (m model) View() string {
 	if m.quitting {
@@ -524,135 +961,372 @@ func (m model) View() string {
 	}
 
 	var s strings.Builder
+	contentHeight := m.height - 6 // reserve for border/padding
 
-	// GROUP VIEW / DELETING / RENAMING (If Group)
-	if m.mode == viewGroups || (m.mode == renaming && m.renameType == 0) || m.mode == deletingGroup {
-		s.WriteString(titleStyle.Render("Groups") + "\n\n")
-
-		for i, g := range m.state.Groups {
-			cursor := "  "
-			if m.groupCursor == i {
-				cursor = "> "
-			}
-
-			// Color logic
-			color := getGroupColor(i)
-			style := lipgloss.NewStyle().Foreground(color)
-
-			if m.groupCursor == i {
-				style = lipgloss.NewStyle().Background(lipgloss.Color("57")).Foreground(color).Bold(true).Padding(0, 1)
-			}
-
-			// Render content
-			content := g
-			if m.mode == renaming && m.groupCursor == i {
-				content = m.input.View() // Edit in place
-			}
-
-			// Delete Confirm
-			if m.mode == deletingGroup && m.groupCursor == i {
-				content += " [DELETE? Ctrl+x / n]"
-				style = style.Foreground(lipgloss.Color("196"))
-			}
-
-			s.WriteString(fmt.Sprintf("%s%s\n", cursor, style.Render(content)))
-		}
-
-		s.WriteString("\n")
-		// Footer for Groups
-		if m.adding {
-			s.WriteString("New Group: " + m.input.View())
+	switch m.state {
+	case stateViewWorkspaces:
+		m.viewWorkspaces(&s, contentHeight)
+	case stateViewGroups:
+		m.viewGroups(&s, contentHeight)
+	case stateViewTasks:
+		if m.currentWorkspace == "HOME" && m.currentGroup == "ALL" {
+			m.viewAllTasks(&s, contentHeight)
 		} else {
-			s.WriteString(lipgloss.NewStyle().Faint(true).Render("Tab: Toggle View • ←/→: Nav • n: Add • r: Rename • x: Delete"))
+			m.viewTasks(&s, contentHeight)
 		}
-
-	} else {
-		// TASK VIEW
-		currentGroup := m.state.LastGroup
-		isAll := (currentGroup == m.state.Groups[0])
-
-		// Header
-		groupIndex := m.state.getGroupIndex(currentGroup)
-		groupColor := getGroupColor(groupIndex)
-
-		header := lipgloss.JoinHorizontal(lipgloss.Left,
-			titleStyle.Render("Tasks"),
-			lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render(" > "),
-			lipgloss.NewStyle().Foreground(groupColor).Bold(true).Render(currentGroup),
-		)
-		s.WriteString(header + "\n\n")
-
-		// Render List (Using Sorted Helper)
-		visibleIndices := m.getVisibleTasks()
-
-		if len(visibleIndices) == 0 {
-			s.WriteString(lipgloss.NewStyle().Faint(true).Render("  No tasks found.") + "\n")
-		} else {
-			for i, realIdx := range visibleIndices {
-				t := m.state.Todos[realIdx]
-
-				cursor := "  "
-				// Check against View List Cursor
-				if m.cursor == i && !m.adding {
-					cursor = "> "
-				}
-
-				// Style
-				tStyle := lipgloss.NewStyle()
-				if t.Done {
-					tStyle = tStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
-				} else {
-					tStyle = tStyle.Foreground(lipgloss.Color("255"))
-				}
-
-				// Active Item Highlight
-				if m.cursor == i && !m.adding {
-					tStyle = tStyle.Foreground(groupColor)
-					cursor = lipgloss.NewStyle().Foreground(groupColor).Render(cursor)
-				}
-
-				// Rename Input Overlay
-				title := t.Title
-				if m.mode == renaming && m.renameType == 1 && m.cursor == i {
-					title = m.input.View()
-				}
-
-				// Group Tag (Only in "All" view) -> [Group] Title
-				var prefix string
-				if isAll {
-					tIdx := m.state.getGroupIndex(t.Group)
-					c := getGroupColor(tIdx)
-					prefix = lipgloss.NewStyle().Foreground(c).Render(fmt.Sprintf("[%s] ", t.Group))
-				}
-
-				s.WriteString(fmt.Sprintf("%s%s%s\n", cursor, prefix, tStyle.Render(title)))
-			}
-		}
-
-		s.WriteString("\n")
-		// Footer for Tasks
-		if m.adding {
-			s.WriteString("  " + m.input.View())
-		} else {
-			s.WriteString(lipgloss.NewStyle().Faint(true).Render("Tab: Toggle View • ←/→: Nav • n: Add • Space: Done • x: Delete"))
-		}
+	case stateTaskDetails:
+		m.viewTaskDetails(&s, contentHeight)
+	case stateGitMenu:
+		m.viewGitMenu(&s, contentHeight)
 	}
 
 	content := s.String()
+	borderColor := lipgloss.Color("62")
 
-	// Full vs Compact
-	if !m.compactMode {
-		borderColor := lipgloss.Color("62")
-		if m.mode == viewTasks {
-			idx := m.state.getGroupIndex(m.state.LastGroup)
-			borderColor = getGroupColor(idx)
+	switch m.state {
+	case stateViewGroups:
+		borderColor = getColor(m.workspaceCursor)
+	case stateViewTasks, stateTaskDetails:
+		borderColor = getColor(m.groupCursor)
+	case stateGitMenu:
+		borderColor = lipgloss.Color("#FFD700")
+	}
+
+	w := m.width
+	h := m.height
+	if w == 0 {
+		w = 80
+	}
+	if h == 0 {
+		h = 24
+	}
+
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center,
+		appStyle.Copy().BorderForeground(borderColor).Width(min(w-4, 70)).Render(content))
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// ── VIEW: WORKSPACES ──
+
+func (m model) viewWorkspaces(s *strings.Builder, maxH int) {
+	s.WriteString(titleStyle.Render("  Workspaces") + "\n\n")
+
+	for i, ws := range m.workspaces {
+		cursor := "  "
+		if m.workspaceCursor == i {
+			cursor = "> "
 		}
 
-		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
-			appStyle.Copy().BorderForeground(borderColor).Render(content))
+		done, total := countWorkspaceTasks(ws)
+		label := fmt.Sprintf("%s (%d/%d)", ws, done, total)
+
+		color := getColor(i)
+		style := lipgloss.NewStyle().Foreground(color)
+		if m.workspaceCursor == i {
+			style = style.Bold(true).Background(lipgloss.Color("236")).Padding(0, 1)
+		}
+
+		if m.confirmDelete && m.workspaceCursor == i {
+			label += " [DELETE? Ctrl+x / n]"
+			style = style.Foreground(lipgloss.Color("196"))
+		}
+
+		s.WriteString(cursor + style.Render(label) + "\n")
 	}
-	return content
+
+	s.WriteString("\n")
+	if m.inputMode == inputAddWorkspace || m.inputMode == inputRenameWorkspace {
+		s.WriteString("  " + m.input.View())
+	} else {
+		s.WriteString(faintStyle.Render("  ↑↓: Nav • Enter: Open • n: New • r: Rename • x: Del • g: Git"))
+	}
 }
+
+// ── VIEW: GROUPS ──
+
+func (m model) viewGroups(s *strings.Builder, maxH int) {
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		titleStyle.Render("  Groups"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  "),
+		lipgloss.NewStyle().Foreground(getColor(m.workspaceCursor)).Bold(true).Render(m.currentWorkspace),
+	)
+	s.WriteString(header + "\n\n")
+
+	for i, g := range m.groups {
+		cursor := "  "
+		if m.groupCursor == i {
+			cursor = "> "
+		}
+
+		done, total := countGroupTasks(m.currentWorkspace, g)
+		label := fmt.Sprintf("%s (%d/%d)", g, done, total)
+
+		color := getColor(i)
+		style := lipgloss.NewStyle().Foreground(color)
+		if m.groupCursor == i {
+			style = style.Bold(true).Background(lipgloss.Color("236")).Padding(0, 1)
+		}
+
+		if m.confirmDelete && m.groupCursor == i {
+			label += " [DELETE? Ctrl+x / n]"
+			style = style.Foreground(lipgloss.Color("196"))
+		}
+
+		s.WriteString(cursor + style.Render(label) + "\n")
+	}
+
+	s.WriteString("\n")
+	if m.inputMode == inputAddGroup || m.inputMode == inputRenameGroup {
+		s.WriteString("  " + m.input.View())
+	} else {
+		s.WriteString(faintStyle.Render("  ←: Back • ↑↓: Nav • Enter: Open • n: New • r: Rename • x: Del"))
+	}
+}
+
+// ── VIEW: TASKS ──
+
+func (m model) viewTasks(s *strings.Builder, maxH int) {
+	color := getColor(m.groupCursor)
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		titleStyle.Render("  Tasks"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  "),
+		lipgloss.NewStyle().Foreground(color).Bold(true).Render(m.currentWorkspace+" > "+m.currentGroup),
+	)
+	s.WriteString(header + "\n\n")
+
+	if len(m.tasks.Todos) == 0 {
+		s.WriteString(faintStyle.Render("  No tasks. Press 'n' to add one.") + "\n")
+	} else {
+		for i, t := range m.tasks.Todos {
+			cursor := "  "
+			if m.taskCursor == i {
+				cursor = "> "
+			}
+
+			check := "[ ]"
+			if t.Done {
+				check = "[x]"
+			}
+			subCount := ""
+			if len(t.Subtasks) > 0 {
+				subDone := 0
+				for _, st := range t.Subtasks {
+					if st.Done {
+						subDone++
+					}
+				}
+				subCount = fmt.Sprintf(" [%d/%d]", subDone, len(t.Subtasks))
+			}
+
+			tStyle := lipgloss.NewStyle()
+			if t.Done {
+				tStyle = tStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
+			} else {
+				tStyle = tStyle.Foreground(lipgloss.Color("255"))
+			}
+			if m.taskCursor == i {
+				tStyle = tStyle.Foreground(color)
+				cursor = lipgloss.NewStyle().Foreground(color).Render(cursor)
+			}
+
+			label := fmt.Sprintf("%s %s%s", check, t.Title, subCount)
+			s.WriteString(fmt.Sprintf("%s%s\n", cursor, tStyle.Render(label)))
+		}
+	}
+
+	s.WriteString("\n")
+	if m.inputMode == inputAddTask || m.inputMode == inputRenameTask {
+		s.WriteString("  " + m.input.View())
+	} else {
+		s.WriteString(faintStyle.Render("  ←: Back • Space: Toggle • Enter: Details • n: New • r: Rename • x: Del • K/J: Reorder"))
+	}
+}
+
+// ── VIEW: ALL VIEW ──
+
+func (m model) viewAllTasks(s *strings.Builder, maxH int) {
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		titleStyle.Render("  All Tasks"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  "),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Bold(true).Render("HOME"),
+	)
+	s.WriteString(header + "\n\n")
+
+	if len(m.allViewItems) == 0 {
+		s.WriteString(faintStyle.Render("  No tasks in any group.") + "\n")
+	} else {
+		for i, entry := range m.allViewItems {
+			cursor := "  "
+			if m.taskCursor == i {
+				cursor = "> "
+			}
+
+			if entry.isHeader {
+				// Group header
+				arrow := "▼"
+				if m.collapsed[entry.groupName] {
+					arrow = "▶"
+				}
+				done, total := countGroupTasks(m.currentWorkspace, entry.groupName)
+				gIdx := indexOf(m.groups, entry.groupName)
+				color := getColor(gIdx)
+				style := lipgloss.NewStyle().Foreground(color).Bold(true)
+				if m.taskCursor == i {
+					style = style.Background(lipgloss.Color("236")).Padding(0, 1)
+				}
+				label := fmt.Sprintf("%s %s (%d/%d)", arrow, entry.groupName, done, total)
+				s.WriteString(cursor + style.Render(label) + "\n")
+			} else {
+				// Task
+				gf := loadGroupFile(m.currentWorkspace, entry.groupName)
+				if entry.taskIndex < len(gf.Todos) {
+					t := gf.Todos[entry.taskIndex]
+					check := "[ ]"
+					if t.Done {
+						check = "[x]"
+					}
+					tStyle := lipgloss.NewStyle()
+					if t.Done {
+						tStyle = tStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
+					} else {
+						tStyle = tStyle.Foreground(lipgloss.Color("255"))
+					}
+					gIdx := indexOf(m.groups, entry.groupName)
+					color := getColor(gIdx)
+					if m.taskCursor == i {
+						tStyle = tStyle.Foreground(color)
+						cursor = lipgloss.NewStyle().Foreground(color).Render(cursor)
+					}
+					label := fmt.Sprintf("    %s %s", check, t.Title)
+					s.WriteString(fmt.Sprintf("%s%s\n", cursor, tStyle.Render(label)))
+				}
+			}
+		}
+	}
+
+	s.WriteString("\n")
+	s.WriteString(faintStyle.Render("  ←: Back • Tab/Space: Toggle • ↑↓: Nav"))
+}
+
+func indexOf(slice []string, val string) int {
+	for i, v := range slice {
+		if v == val {
+			return i
+		}
+	}
+	return 0
+}
+
+// ── VIEW: TASK DETAILS ──
+
+func (m model) viewTaskDetails(s *strings.Builder, maxH int) {
+	if m.taskCursor >= len(m.tasks.Todos) {
+		s.WriteString("No task selected.\n")
+		return
+	}
+	task := m.tasks.Todos[m.taskCursor]
+	color := getColor(m.groupCursor)
+
+	s.WriteString(titleStyle.Render("  Task Details") + "\n\n")
+
+	// Title
+	titleLabel := lipgloss.NewStyle().Foreground(color).Bold(true).Render(task.Title)
+	s.WriteString("  Title: " + titleLabel + "\n")
+
+	// Description
+	desc := task.Description
+	if desc == "" {
+		desc = lipgloss.NewStyle().Faint(true).Render("(no description)")
+	}
+	s.WriteString("  Desc:  " + desc + "\n\n")
+
+	// Subtasks
+	s.WriteString(boldStyle.Foreground(color).Render("  Subtasks") + "\n")
+	if len(task.Subtasks) == 0 {
+		s.WriteString(faintStyle.Render("    No subtasks. Press 'n' to add.") + "\n")
+	} else {
+		for i, st := range task.Subtasks {
+			cursor := "  "
+			if m.subtaskCursor == i {
+				cursor = "> "
+			}
+			check := "[ ]"
+			if st.Done {
+				check = "[x]"
+			}
+			stStyle := lipgloss.NewStyle()
+			if st.Done {
+				stStyle = stStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
+			} else {
+				stStyle = stStyle.Foreground(lipgloss.Color("255"))
+			}
+			if m.subtaskCursor == i {
+				stStyle = stStyle.Foreground(color)
+			}
+			s.WriteString(fmt.Sprintf("  %s%s\n", cursor, stStyle.Render(check+" "+st.Title)))
+		}
+	}
+
+	s.WriteString("\n")
+	if m.inputMode == inputAddSubtask || m.inputMode == inputRenameTaskTitle || m.inputMode == inputEditDescription {
+		s.WriteString("  " + m.input.View())
+	} else {
+		s.WriteString(faintStyle.Render("  Esc: Back • r: Rename • d: Description • n: Add Subtask • Space: Toggle • x: Del • K/J: Reorder"))
+	}
+}
+
+// ── VIEW: GIT MENU ──
+
+func (m model) viewGitMenu(s *strings.Builder, maxH int) {
+	s.WriteString(titleStyle.Copy().Background(lipgloss.Color("#FFD700")).Foreground(lipgloss.Color("0")).Render("  Git Integration") + "\n\n")
+
+	for i, item := range m.gitItems {
+		cursor := "  "
+		if m.gitMenuCursor == i {
+			cursor = "> "
+		}
+		style := lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
+		if m.gitMenuCursor == i {
+			style = style.Bold(true).Foreground(lipgloss.Color("#FFD700"))
+		}
+		s.WriteString(cursor + style.Render(item) + "\n")
+	}
+
+	if m.inputMode == inputGitRemote {
+		s.WriteString("\n  " + m.input.View())
+	}
+
+	if m.gitOutput != "" {
+		s.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("─── Output ───") + "\n")
+		// Limit output lines
+		lines := strings.Split(m.gitOutput, "\n")
+		maxLines := 10
+		if maxH > 0 {
+			maxLines = maxH - 10
+		}
+		if maxLines < 3 {
+			maxLines = 3
+		}
+		if len(lines) > maxLines {
+			lines = lines[:maxLines]
+			lines = append(lines, "...")
+		}
+		for _, l := range lines {
+			s.WriteString("  " + l + "\n")
+		}
+	}
+
+	s.WriteString("\n")
+	s.WriteString(faintStyle.Render("  Esc: Back • ↑↓: Nav • Enter: Run"))
+}
+
+// ─── MAIN ───
 
 func main() {
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
