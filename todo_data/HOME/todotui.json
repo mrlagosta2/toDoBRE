@@ -1,0 +1,35 @@
+{
+  "title": "todotui",
+  "todos": [
+    {
+      "title": "aprimorar menu git",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "corrigir bug de delecao se rename for igual",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "melhorar navegacao subtasks",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "tab para toggle de interface",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "cor ta definida por posicao, nao por grupo",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    }
+  ]
+}
