@@ -10,11 +10,12 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-// ─── DATA STRUCTURES ───
+// ─── DATA STRUCTURES ───────────────────────────────────────────────────────────
 
 type Subtask struct {
 	Title string `json:"title"`
@@ -45,7 +46,7 @@ type OldAppState struct {
 	LastGroup string    `json:"last_group"`
 }
 
-// ─── STATE MACHINE ───
+// ─── STATE MACHINE ──────────────────────────────────────────────────────────────
 
 type sessionState int
 
@@ -54,7 +55,7 @@ const (
 	stateViewGroups
 	stateViewTasks
 	stateTaskDetails
-	stateGitMenu
+	stateGitConsole
 )
 
 type inputTarget int
@@ -70,14 +71,13 @@ const (
 	inputRenameTask
 	inputRenameTaskTitle
 	inputEditDescription
-	inputGitRemote
 )
 
-// ─── MODEL ───
+// ─── MODEL ──────────────────────────────────────────────────────────────────────
 
 type model struct {
 	state     sessionState
-	prevState sessionState // for git menu return
+	prevState sessionState // for git console return
 
 	workspaces       []string
 	workspaceCursor  int
@@ -92,14 +92,14 @@ type model struct {
 
 	subtaskCursor int
 
-	// Git
-	gitMenuCursor int
-	gitOutput     string
-	gitItems      []string
+	// Git Console
+	gitViewport viewport.Model
+	gitInput    textinput.Model
+	gitHistory  string
 
 	// All view collapse
 	collapsed    map[string]bool
-	allViewItems []allViewEntry // computed for navigation
+	allViewItems []allViewEntry
 
 	// Input
 	input         textinput.Model
@@ -107,18 +107,20 @@ type model struct {
 	adding        bool
 	confirmDelete bool
 
-	quitting bool
-	width    int
-	height   int
+	// Display
+	compactMode bool
+	quitting    bool
+	width       int
+	height      int
 }
 
 type allViewEntry struct {
 	isHeader  bool
 	groupName string
-	taskIndex int // index within that group's Todos
+	taskIndex int
 }
 
-// ─── STYLING ───
+// ─── STYLING ────────────────────────────────────────────────────────────────────
 
 var (
 	palette = []lipgloss.Color{
@@ -150,7 +152,7 @@ func getColor(index int) lipgloss.Color {
 	return palette[(index-1)%len(palette)]
 }
 
-// ─── PERSISTENCE ───
+// ─── PERSISTENCE ────────────────────────────────────────────────────────────────
 
 func getDataDir() string {
 	exe, err := os.Executable()
@@ -175,9 +177,8 @@ func ensureDir(path string) {
 func loadWorkspaces() []string {
 	dir := getDataDir()
 	ensureDir(dir)
-	// Ensure HOME always exists
 	ensureDir(filepath.Join(dir, "HOME"))
-	// Ensure HOME/ALL.json exists
+
 	allPath := filepath.Join(dir, "HOME", "ALL.json")
 	if _, err := os.Stat(allPath); os.IsNotExist(err) {
 		g := GroupFile{Title: "ALL", Todos: []Todo{}}
@@ -204,7 +205,6 @@ func loadWorkspaces() []string {
 	if !hasHome {
 		ws = append([]string{"HOME"}, ws...)
 	} else {
-		// Ensure HOME is at index 0
 		sorted := []string{"HOME"}
 		for _, w := range ws {
 			if w != "HOME" {
@@ -244,12 +244,10 @@ func loadGroups(workspace string) []string {
 
 	if workspace == "HOME" && !hasAll {
 		groups = append([]string{"ALL"}, groups...)
-		// Create the file
 		g := GroupFile{Title: "ALL", Todos: []Todo{}}
 		data, _ := json.MarshalIndent(g, "", "  ")
 		_ = os.WriteFile(filepath.Join(dir, "ALL.json"), data, 0644)
 	} else if workspace == "HOME" {
-		// Ensure ALL is at index 0
 		sorted := []string{"ALL"}
 		for _, g := range groups {
 			if g != "ALL" {
@@ -283,7 +281,6 @@ func saveGroupFile(workspace, group string, gf GroupFile) {
 	}
 	_ = os.WriteFile(filepath.Join(primary, group+".json"), data, 0644)
 
-	// Backup
 	backup := getBackupDir()
 	if backup != "" {
 		bDir := filepath.Join(backup, workspace)
@@ -338,7 +335,7 @@ func countWorkspaceTasks(workspace string) (done, total int) {
 	return
 }
 
-// ─── MIGRATION ───
+// ─── MIGRATION ──────────────────────────────────────────────────────────────────
 
 func migrateOldData() {
 	cfg, err := os.UserConfigDir()
@@ -351,7 +348,6 @@ func migrateOldData() {
 		return
 	}
 
-	// Try new format first
 	var oldState OldAppState
 	if err := json.Unmarshal(data, &oldState); err != nil {
 		return
@@ -360,7 +356,6 @@ func migrateOldData() {
 		return
 	}
 
-	// Group tasks by their group name
 	grouped := map[string][]Todo{}
 	for _, ot := range oldState.Todos {
 		g := ot.Group
@@ -373,7 +368,6 @@ func migrateOldData() {
 		})
 	}
 
-	// Also create empty groups that existed
 	for _, gName := range oldState.Groups {
 		if gName == "" || gName == "All" {
 			gName = "ALL"
@@ -383,17 +377,15 @@ func migrateOldData() {
 		}
 	}
 
-	// Write to HOME workspace
 	for gName, todos := range grouped {
 		gf := GroupFile{Title: gName, Todos: todos}
 		saveGroupFile("HOME", gName, gf)
 	}
 
-	// Rename old file
 	_ = os.Rename(oldPath, oldPath+".migrated")
 }
 
-// ─── GIT HELPERS ───
+// ─── GIT HELPERS ────────────────────────────────────────────────────────────────
 
 func runGitCmd(args ...string) string {
 	cmd := exec.Command("git", args...)
@@ -405,7 +397,7 @@ func runGitCmd(args ...string) string {
 	return string(out)
 }
 
-// ─── INIT ───
+// ─── INIT ───────────────────────────────────────────────────────────────────────
 
 func initialModel() model {
 	migrateOldData()
@@ -415,6 +407,15 @@ func initialModel() model {
 	ti.Focus()
 	ti.Prompt = ""
 
+	gi := textinput.New()
+	gi.Placeholder = "command..."
+	gi.Prompt = "git > "
+	gi.Focus()
+	gi.CharLimit = 256
+
+	vp := viewport.New(70, 10)
+	vp.SetContent("")
+
 	ws := loadWorkspaces()
 
 	return model{
@@ -422,7 +423,8 @@ func initialModel() model {
 		workspaces:       ws,
 		currentWorkspace: "HOME",
 		input:            ti,
-		gitItems:         []string{"Status", "Sync (Pull/Push)", "Commit", "Configure Remote"},
+		gitInput:         gi,
+		gitViewport:      vp,
 		collapsed:        make(map[string]bool),
 	}
 }
@@ -431,7 +433,7 @@ func (m model) Init() tea.Cmd {
 	return tea.EnterAltScreen
 }
 
-// ─── ALL VIEW HELPERS ───
+// ─── ALL VIEW HELPERS ───────────────────────────────────────────────────────────
 
 func (m *model) buildAllViewItems() {
 	m.allViewItems = nil
@@ -450,7 +452,7 @@ func (m *model) buildAllViewItems() {
 	}
 }
 
-// ─── UPDATE ───
+// ─── UPDATE ─────────────────────────────────────────────────────────────────────
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.quitting {
@@ -462,6 +464,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// Resize git viewport
+		vpW := clamp(m.width-10, 40, 70)
+		vpH := clamp(m.height-12, 5, 40)
+		m.gitViewport.Width = vpW
+		m.gitViewport.Height = vpH
 		return m, nil
 
 	case tea.KeyMsg:
@@ -473,9 +480,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.confirmDelete {
 			return m.handleConfirmDelete(msg)
 		}
-		// ── GIT MENU ──
-		if m.state == stateGitMenu {
-			return m.handleGitMenu(msg)
+		// ── GIT CONSOLE ──
+		if m.state == stateGitConsole {
+			return m.handleGitConsole(msg)
 		}
 		// ── TASK DETAILS ──
 		if m.state == stateTaskDetails {
@@ -488,10 +495,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "g":
 			m.prevState = m.state
-			m.state = stateGitMenu
-			m.gitMenuCursor = 0
-			m.gitOutput = ""
-			return m, nil
+			m.state = stateGitConsole
+			m.gitHistory = ""
+			m.gitViewport.SetContent(lipgloss.NewStyle().Faint(true).Render("  Type a git command and press Enter. (e.g. status, log --oneline -5)"))
+			m.gitViewport.GotoBottom()
+			m.gitInput.Reset()
+			m.gitInput.Focus()
+			return m, textinput.Blink
+		case "tab":
+			m.compactMode = !m.compactMode
+			if m.compactMode {
+				return m, tea.ExitAltScreen
+			}
+			return m, tea.EnterAltScreen
 		}
 		// ── STATE-SPECIFIC ──
 		switch m.state {
@@ -506,63 +522,71 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// ── INPUT HANDLER ──
+// ── INPUT HANDLER ───────────────────────────────────────────────────────────────
 
 func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEnter:
 		val := strings.TrimSpace(m.input.Value())
-		if val != "" {
-			switch m.inputMode {
-			case inputAddWorkspace:
+
+		switch m.inputMode {
+		case inputAddWorkspace:
+			if val != "" {
 				name := strings.ToUpper(val)
 				createWorkspace(name)
 				m.workspaces = loadWorkspaces()
-			case inputAddGroup:
+			}
+		case inputAddGroup:
+			if val != "" {
 				gf := GroupFile{Title: val, Todos: []Todo{}}
 				saveGroupFile(m.currentWorkspace, val, gf)
 				m.groups = loadGroups(m.currentWorkspace)
-			case inputAddTask:
+			}
+		case inputAddTask:
+			if val != "" {
 				m.tasks.Todos = append(m.tasks.Todos, Todo{Title: val})
 				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
-			case inputAddSubtask:
-				if m.taskCursor < len(m.tasks.Todos) {
-					m.tasks.Todos[m.taskCursor].Subtasks = append(m.tasks.Todos[m.taskCursor].Subtasks, Subtask{Title: val})
-					saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
-				}
-			case inputRenameWorkspace:
-				if m.workspaceCursor > 0 && m.workspaceCursor < len(m.workspaces) {
-					oldName := m.workspaces[m.workspaceCursor]
-					newName := strings.ToUpper(val)
+			}
+		case inputAddSubtask:
+			if val != "" && m.taskCursor < len(m.tasks.Todos) {
+				m.tasks.Todos[m.taskCursor].Subtasks = append(m.tasks.Todos[m.taskCursor].Subtasks, Subtask{Title: val})
+				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+			}
+		case inputRenameWorkspace:
+			if val != "" && m.workspaceCursor > 0 && m.workspaceCursor < len(m.workspaces) {
+				oldName := m.workspaces[m.workspaceCursor]
+				newName := strings.ToUpper(val)
+				// Cancel if identical
+				if newName != oldName {
 					oldPath := filepath.Join(getDataDir(), oldName)
 					newPath := filepath.Join(getDataDir(), newName)
 					_ = os.Rename(oldPath, newPath)
 					m.workspaces = loadWorkspaces()
 				}
-			case inputRenameGroup:
-				if m.groupCursor < len(m.groups) {
-					oldName := m.groups[m.groupCursor]
-					if !(m.currentWorkspace == "HOME" && oldName == "ALL") {
-						gf := loadGroupFile(m.currentWorkspace, oldName)
-						gf.Title = val
-						saveGroupFile(m.currentWorkspace, val, gf)
-						deleteGroupFile(m.currentWorkspace, oldName)
-						m.groups = loadGroups(m.currentWorkspace)
-					}
+			}
+		case inputRenameGroup:
+			if val != "" && m.groupCursor < len(m.groups) {
+				oldName := m.groups[m.groupCursor]
+				if !(m.currentWorkspace == "HOME" && oldName == "ALL") && val != oldName {
+					gf := loadGroupFile(m.currentWorkspace, oldName)
+					gf.Title = val
+					saveGroupFile(m.currentWorkspace, val, gf)
+					deleteGroupFile(m.currentWorkspace, oldName)
+					m.groups = loadGroups(m.currentWorkspace)
 				}
-			case inputRenameTask, inputRenameTaskTitle:
-				if m.taskCursor < len(m.tasks.Todos) {
+			}
+		case inputRenameTask, inputRenameTaskTitle:
+			if val != "" && m.taskCursor < len(m.tasks.Todos) {
+				oldTitle := m.tasks.Todos[m.taskCursor].Title
+				if val != oldTitle {
 					m.tasks.Todos[m.taskCursor].Title = val
 					saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
 				}
-			case inputEditDescription:
-				if m.taskCursor < len(m.tasks.Todos) {
-					m.tasks.Todos[m.taskCursor].Description = val
-					saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
-				}
-			case inputGitRemote:
-				runGitCmd("remote", "add", "origin", val)
-				m.gitOutput = "Remote added: " + val
+			}
+		case inputEditDescription:
+			if m.taskCursor < len(m.tasks.Todos) {
+				m.tasks.Todos[m.taskCursor].Description = val
+				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
 			}
 		}
 		m.inputMode = inputNone
@@ -579,7 +603,7 @@ func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// ── CONFIRM DELETE ──
+// ── CONFIRM DELETE ──────────────────────────────────────────────────────────────
 
 func (m model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -612,53 +636,67 @@ func (m model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
 			}
+		case stateTaskDetails:
+			if m.taskCursor < len(m.tasks.Todos) {
+				task := &m.tasks.Todos[m.taskCursor]
+				if m.subtaskCursor < len(task.Subtasks) {
+					task.Subtasks = append(task.Subtasks[:m.subtaskCursor], task.Subtasks[m.subtaskCursor+1:]...)
+					if m.subtaskCursor >= len(task.Subtasks) && m.subtaskCursor > 0 {
+						m.subtaskCursor--
+					}
+					saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+				}
+			}
 		}
 		m.confirmDelete = false
-	case "n", "esc":
+	default:
 		m.confirmDelete = false
 	}
 	return m, nil
 }
 
-// ── GIT MENU ──
+// ── GIT CONSOLE HANDLER ────────────────────────────────────────────────────────
 
-func (m model) handleGitMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc", "q":
+func (m model) handleGitConsole(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC, tea.KeyEsc:
 		m.state = m.prevState
 		return m, nil
-	case "up", "k":
-		if m.gitMenuCursor > 0 {
-			m.gitMenuCursor--
+	case tea.KeyEnter:
+		rawCmd := strings.TrimSpace(m.gitInput.Value())
+		if rawCmd == "" {
+			return m, nil
 		}
-	case "down", "j":
-		if m.gitMenuCursor < len(m.gitItems)-1 {
-			m.gitMenuCursor++
+		m.gitInput.Reset()
+
+		// Strip leading "git " if user typed it
+		cleanCmd := rawCmd
+		if strings.HasPrefix(strings.ToLower(cleanCmd), "git ") {
+			cleanCmd = strings.TrimSpace(cleanCmd[4:])
 		}
-	case "enter":
-		switch m.gitMenuCursor {
-		case 0: // Status
-			m.gitOutput = runGitCmd("status")
-		case 1: // Sync
-			out := runGitCmd("pull")
-			out += "\n" + runGitCmd("push")
-			m.gitOutput = out
-		case 2: // Commit
-			runGitCmd("add", ".")
-			ts := time.Now().Format("2006-01-02 15:04:05")
-			m.gitOutput = runGitCmd("commit", "-m", "Auto-update "+ts)
-		case 3: // Configure Remote
-			m.inputMode = inputGitRemote
-			m.input.Placeholder = "Remote URL..."
-			m.input.Reset()
-			m.input.Focus()
-			return m, textinput.Blink
+
+		args := strings.Fields(cleanCmd)
+		output := runGitCmd(args...)
+		output = strings.TrimRight(output, "\n\r ")
+
+		// Append to history
+		entry := fmt.Sprintf("$ git %s\n%s\n", cleanCmd, output)
+		if m.gitHistory == "" {
+			m.gitHistory = entry
+		} else {
+			m.gitHistory += "\n" + entry
 		}
+		m.gitViewport.SetContent(m.gitHistory)
+		m.gitViewport.GotoBottom()
+		return m, nil
 	}
-	return m, nil
+	// Pass key events to the text input
+	var cmd tea.Cmd
+	m.gitInput, cmd = m.gitInput.Update(msg)
+	return m, cmd
 }
 
-// ── WORKSPACE HANDLER ──
+// ── WORKSPACE HANDLER ───────────────────────────────────────────────────────────
 
 func (m model) handleWorkspaces(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -690,7 +728,7 @@ func (m model) handleWorkspaces(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 			return m, textinput.Blink
 		}
-	case "x":
+	case "ctrl+x":
 		if m.workspaceCursor > 0 {
 			m.confirmDelete = true
 		}
@@ -708,7 +746,7 @@ func (m model) handleWorkspaces(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── GROUP HANDLER ──
+// ── GROUP HANDLER ───────────────────────────────────────────────────────────────
 
 func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -727,7 +765,6 @@ func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.groupCursor < len(m.groups) {
 			m.currentGroup = m.groups[m.groupCursor]
 			if m.currentWorkspace == "HOME" && m.currentGroup == "ALL" {
-				// ALL view: build aggregated items
 				m.buildAllViewItems()
 			}
 			m.tasks = loadGroupFile(m.currentWorkspace, m.currentGroup)
@@ -747,7 +784,7 @@ func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 			return m, textinput.Blink
 		}
-	case "x":
+	case "ctrl+x":
 		if !(m.currentWorkspace == "HOME" && m.groupCursor == 0) && m.groupCursor < len(m.groups) {
 			m.confirmDelete = true
 		}
@@ -757,7 +794,6 @@ func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			minIdx = 1
 		}
 		if m.groupCursor > minIdx {
-			// Rename files to swap order: we store order by filesystem, so we track by reloading
 			m.groups[m.groupCursor], m.groups[m.groupCursor-1] = m.groups[m.groupCursor-1], m.groups[m.groupCursor]
 			m.groupCursor--
 		}
@@ -774,7 +810,7 @@ func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── TASK HANDLER ──
+// ── TASK HANDLER ────────────────────────────────────────────────────────────────
 
 func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	isAllView := m.currentWorkspace == "HOME" && m.currentGroup == "ALL"
@@ -800,7 +836,7 @@ func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.tasks.Todos[m.taskCursor].Done = !m.tasks.Todos[m.taskCursor].Done
 			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
 		}
-	case "enter":
+	case "enter", "right":
 		if m.taskCursor < len(m.tasks.Todos) {
 			m.subtaskCursor = 0
 			m.state = stateTaskDetails
@@ -818,13 +854,18 @@ func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.Focus()
 			return m, textinput.Blink
 		}
-	case "x":
+	case "ctrl+x":
 		if m.taskCursor < len(m.tasks.Todos) {
-			m.tasks.Todos = append(m.tasks.Todos[:m.taskCursor], m.tasks.Todos[m.taskCursor+1:]...)
-			if m.taskCursor >= len(m.tasks.Todos) && m.taskCursor > 0 {
-				m.taskCursor--
+			if len(m.tasks.Todos[m.taskCursor].Subtasks) > 0 {
+				m.confirmDelete = true
+			} else {
+				// Direct delete for tasks without subtasks
+				m.tasks.Todos = append(m.tasks.Todos[:m.taskCursor], m.tasks.Todos[m.taskCursor+1:]...)
+				if m.taskCursor >= len(m.tasks.Todos) && m.taskCursor > 0 {
+					m.taskCursor--
+				}
+				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
 			}
-			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
 		}
 	case "shift+up", "K":
 		if m.taskCursor > 0 {
@@ -842,7 +883,7 @@ func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── ALL VIEW TASK HANDLER ──
+// ── ALL VIEW TASK HANDLER ───────────────────────────────────────────────────────
 
 func (m model) handleAllViewTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -857,7 +898,7 @@ func (m model) handleAllViewTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.taskCursor < len(m.allViewItems)-1 {
 			m.taskCursor++
 		}
-	case "tab", " ":
+	case " ":
 		if m.taskCursor < len(m.allViewItems) {
 			entry := m.allViewItems[m.taskCursor]
 			if entry.isHeader {
@@ -867,7 +908,6 @@ func (m model) handleAllViewTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.taskCursor = len(m.allViewItems) - 1
 				}
 			} else {
-				// Toggle done
 				gf := loadGroupFile(m.currentWorkspace, entry.groupName)
 				if entry.taskIndex < len(gf.Todos) {
 					gf.Todos[entry.taskIndex].Done = !gf.Todos[entry.taskIndex].Done
@@ -888,7 +928,7 @@ func (m model) handleAllViewTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ── TASK DETAILS HANDLER ──
+// ── TASK DETAILS HANDLER ────────────────────────────────────────────────────────
 
 func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.taskCursor >= len(m.tasks.Todos) {
@@ -898,7 +938,7 @@ func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	task := &m.tasks.Todos[m.taskCursor]
 
 	switch msg.String() {
-	case "esc":
+	case "esc", "left":
 		m.state = stateViewTasks
 	case "up", "k":
 		if m.subtaskCursor > 0 {
@@ -929,7 +969,7 @@ func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.SetValue(task.Description)
 		m.input.Focus()
 		return m, textinput.Blink
-	case "x":
+	case "ctrl+x":
 		if m.subtaskCursor < len(task.Subtasks) {
 			task.Subtasks = append(task.Subtasks[:m.subtaskCursor], task.Subtasks[m.subtaskCursor+1:]...)
 			if m.subtaskCursor >= len(task.Subtasks) && m.subtaskCursor > 0 {
@@ -953,7 +993,7 @@ func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// ─── VIEW ───
+// ─── VIEW ───────────────────────────────────────────────────────────────────────
 
 func (m model) View() string {
 	if m.quitting {
@@ -961,7 +1001,10 @@ func (m model) View() string {
 	}
 
 	var s strings.Builder
-	contentHeight := m.height - 6 // reserve for border/padding
+	contentHeight := m.height - 6
+	if contentHeight < 5 {
+		contentHeight = 5
+	}
 
 	switch m.state {
 	case stateViewWorkspaces:
@@ -976,19 +1019,25 @@ func (m model) View() string {
 		}
 	case stateTaskDetails:
 		m.viewTaskDetails(&s, contentHeight)
-	case stateGitMenu:
-		m.viewGitMenu(&s, contentHeight)
+	case stateGitConsole:
+		m.viewGitConsole(&s, contentHeight)
 	}
 
 	content := s.String()
-	borderColor := lipgloss.Color("62")
 
+	// ── COMPACT MODE ──
+	if m.compactMode {
+		return content + "\n"
+	}
+
+	// ── FULL MODE (Boxed) ──
+	borderColor := lipgloss.Color("62")
 	switch m.state {
 	case stateViewGroups:
 		borderColor = getColor(m.workspaceCursor)
 	case stateViewTasks, stateTaskDetails:
 		borderColor = getColor(m.groupCursor)
-	case stateGitMenu:
+	case stateGitConsole:
 		borderColor = lipgloss.Color("#FFD700")
 	}
 
@@ -1002,22 +1051,18 @@ func (m model) View() string {
 	}
 
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center,
-		appStyle.Copy().BorderForeground(borderColor).Width(min(w-4, 70)).Render(content))
+		appStyle.Copy().BorderForeground(borderColor).Width(clamp(w-4, 40, 70)).Render(content))
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// ── VIEW: WORKSPACES ──
+// ── VIEW: WORKSPACES ────────────────────────────────────────────────────────────
 
 func (m model) viewWorkspaces(s *strings.Builder, maxH int) {
 	s.WriteString(titleStyle.Render("  Workspaces") + "\n\n")
 
-	for i, ws := range m.workspaces {
+	visibleStart, visibleEnd := scrollWindow(m.workspaceCursor, len(m.workspaces), maxH-4)
+
+	for i := visibleStart; i < visibleEnd; i++ {
+		ws := m.workspaces[i]
 		cursor := "  "
 		if m.workspaceCursor == i {
 			cursor = "> "
@@ -1033,22 +1078,26 @@ func (m model) viewWorkspaces(s *strings.Builder, maxH int) {
 		}
 
 		if m.confirmDelete && m.workspaceCursor == i {
-			label += " [DELETE? Ctrl+x / n]"
+			label += " [DELETE? Ctrl+x / any]"
 			style = style.Foreground(lipgloss.Color("196"))
 		}
 
 		s.WriteString(cursor + style.Render(label) + "\n")
 	}
 
+	if visibleEnd < len(m.workspaces) {
+		s.WriteString(faintStyle.Render(fmt.Sprintf("  ... +%d more", len(m.workspaces)-visibleEnd)) + "\n")
+	}
+
 	s.WriteString("\n")
 	if m.inputMode == inputAddWorkspace || m.inputMode == inputRenameWorkspace {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ↑↓: Nav • Enter: Open • n: New • r: Rename • x: Del • g: Git"))
+		s.WriteString(faintStyle.Render("  ↑↓: Nav • →/Enter: Open • n: New • r: Rename • Ctrl+x: Del • g: Git"))
 	}
 }
 
-// ── VIEW: GROUPS ──
+// ── VIEW: GROUPS ────────────────────────────────────────────────────────────────
 
 func (m model) viewGroups(s *strings.Builder, maxH int) {
 	header := lipgloss.JoinHorizontal(lipgloss.Left,
@@ -1058,7 +1107,10 @@ func (m model) viewGroups(s *strings.Builder, maxH int) {
 	)
 	s.WriteString(header + "\n\n")
 
-	for i, g := range m.groups {
+	visibleStart, visibleEnd := scrollWindow(m.groupCursor, len(m.groups), maxH-4)
+
+	for i := visibleStart; i < visibleEnd; i++ {
+		g := m.groups[i]
 		cursor := "  "
 		if m.groupCursor == i {
 			cursor = "> "
@@ -1074,22 +1126,26 @@ func (m model) viewGroups(s *strings.Builder, maxH int) {
 		}
 
 		if m.confirmDelete && m.groupCursor == i {
-			label += " [DELETE? Ctrl+x / n]"
+			label += " [DELETE? Ctrl+x / any]"
 			style = style.Foreground(lipgloss.Color("196"))
 		}
 
 		s.WriteString(cursor + style.Render(label) + "\n")
 	}
 
+	if visibleEnd < len(m.groups) {
+		s.WriteString(faintStyle.Render(fmt.Sprintf("  ... +%d more", len(m.groups)-visibleEnd)) + "\n")
+	}
+
 	s.WriteString("\n")
 	if m.inputMode == inputAddGroup || m.inputMode == inputRenameGroup {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ←: Back • ↑↓: Nav • Enter: Open • n: New • r: Rename • x: Del"))
+		s.WriteString(faintStyle.Render("  ←: Back • ↑↓: Nav • →/Enter: Open • n: New • r: Rename • Ctrl+x: Del"))
 	}
 }
 
-// ── VIEW: TASKS ──
+// ── VIEW: TASKS ─────────────────────────────────────────────────────────────────
 
 func (m model) viewTasks(s *strings.Builder, maxH int) {
 	color := getColor(m.groupCursor)
@@ -1103,7 +1159,10 @@ func (m model) viewTasks(s *strings.Builder, maxH int) {
 	if len(m.tasks.Todos) == 0 {
 		s.WriteString(faintStyle.Render("  No tasks. Press 'n' to add one.") + "\n")
 	} else {
-		for i, t := range m.tasks.Todos {
+		visibleStart, visibleEnd := scrollWindow(m.taskCursor, len(m.tasks.Todos), maxH-4)
+
+		for i := visibleStart; i < visibleEnd; i++ {
+			t := m.tasks.Todos[i]
 			cursor := "  "
 			if m.taskCursor == i {
 				cursor = "> "
@@ -1135,8 +1194,17 @@ func (m model) viewTasks(s *strings.Builder, maxH int) {
 				cursor = lipgloss.NewStyle().Foreground(color).Render(cursor)
 			}
 
-			label := fmt.Sprintf("%s %s%s", check, t.Title, subCount)
-			s.WriteString(fmt.Sprintf("%s%s\n", cursor, tStyle.Render(label)))
+			if m.confirmDelete && m.taskCursor == i {
+				label := fmt.Sprintf("%s %s%s [DELETE? Ctrl+x / any]", check, t.Title, subCount)
+				s.WriteString(fmt.Sprintf("%s%s\n", cursor, lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(label)))
+			} else {
+				label := fmt.Sprintf("%s %s%s", check, t.Title, subCount)
+				s.WriteString(fmt.Sprintf("%s%s\n", cursor, tStyle.Render(label)))
+			}
+		}
+
+		if visibleEnd < len(m.tasks.Todos) {
+			s.WriteString(faintStyle.Render(fmt.Sprintf("  ... +%d more", len(m.tasks.Todos)-visibleEnd)) + "\n")
 		}
 	}
 
@@ -1144,11 +1212,11 @@ func (m model) viewTasks(s *strings.Builder, maxH int) {
 	if m.inputMode == inputAddTask || m.inputMode == inputRenameTask {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ←: Back • Space: Toggle • Enter: Details • n: New • r: Rename • x: Del • K/J: Reorder"))
+		s.WriteString(faintStyle.Render("  ←: Back • Space: ✓ • →/Enter: Details • n: New • r: Rename • Ctrl+x: Del • K/J: Reorder"))
 	}
 }
 
-// ── VIEW: ALL VIEW ──
+// ── VIEW: ALL VIEW ──────────────────────────────────────────────────────────────
 
 func (m model) viewAllTasks(s *strings.Builder, maxH int) {
 	header := lipgloss.JoinHorizontal(lipgloss.Left,
@@ -1161,14 +1229,16 @@ func (m model) viewAllTasks(s *strings.Builder, maxH int) {
 	if len(m.allViewItems) == 0 {
 		s.WriteString(faintStyle.Render("  No tasks in any group.") + "\n")
 	} else {
-		for i, entry := range m.allViewItems {
+		visibleStart, visibleEnd := scrollWindow(m.taskCursor, len(m.allViewItems), maxH-4)
+
+		for i := visibleStart; i < visibleEnd; i++ {
+			entry := m.allViewItems[i]
 			cursor := "  "
 			if m.taskCursor == i {
 				cursor = "> "
 			}
 
 			if entry.isHeader {
-				// Group header
 				arrow := "▼"
 				if m.collapsed[entry.groupName] {
 					arrow = "▶"
@@ -1183,7 +1253,6 @@ func (m model) viewAllTasks(s *strings.Builder, maxH int) {
 				label := fmt.Sprintf("%s %s (%d/%d)", arrow, entry.groupName, done, total)
 				s.WriteString(cursor + style.Render(label) + "\n")
 			} else {
-				// Task
 				gf := loadGroupFile(m.currentWorkspace, entry.groupName)
 				if entry.taskIndex < len(gf.Todos) {
 					t := gf.Todos[entry.taskIndex]
@@ -1208,10 +1277,14 @@ func (m model) viewAllTasks(s *strings.Builder, maxH int) {
 				}
 			}
 		}
+
+		if visibleEnd < len(m.allViewItems) {
+			s.WriteString(faintStyle.Render(fmt.Sprintf("  ... +%d more", len(m.allViewItems)-visibleEnd)) + "\n")
+		}
 	}
 
 	s.WriteString("\n")
-	s.WriteString(faintStyle.Render("  ←: Back • Tab/Space: Toggle • ↑↓: Nav"))
+	s.WriteString(faintStyle.Render("  ←: Back • Space: Toggle • ↑↓: Nav"))
 }
 
 func indexOf(slice []string, val string) int {
@@ -1223,7 +1296,7 @@ func indexOf(slice []string, val string) int {
 	return 0
 }
 
-// ── VIEW: TASK DETAILS ──
+// ── VIEW: TASK DETAILS ──────────────────────────────────────────────────────────
 
 func (m model) viewTaskDetails(s *strings.Builder, maxH int) {
 	if m.taskCursor >= len(m.tasks.Todos) {
@@ -1277,58 +1350,75 @@ func (m model) viewTaskDetails(s *strings.Builder, maxH int) {
 	if m.inputMode == inputAddSubtask || m.inputMode == inputRenameTaskTitle || m.inputMode == inputEditDescription {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  Esc: Back • r: Rename • d: Description • n: Add Subtask • Space: Toggle • x: Del • K/J: Reorder"))
+		s.WriteString(faintStyle.Render("  ←/Esc: Back • r: Rename • d: Description • n: Add Subtask • Space: ✓ • Ctrl+x: Del • K/J: Reorder"))
 	}
 }
 
-// ── VIEW: GIT MENU ──
+// ── VIEW: GIT CONSOLE ───────────────────────────────────────────────────────────
 
-func (m model) viewGitMenu(s *strings.Builder, maxH int) {
-	s.WriteString(titleStyle.Copy().Background(lipgloss.Color("#FFD700")).Foreground(lipgloss.Color("0")).Render("  Git Integration") + "\n\n")
+func (m model) viewGitConsole(s *strings.Builder, maxH int) {
+	header := titleStyle.Copy().
+		Background(lipgloss.Color("#FFD700")).
+		Foreground(lipgloss.Color("0")).
+		Render("  Git Console")
+	s.WriteString(header + "\n\n")
 
-	for i, item := range m.gitItems {
-		cursor := "  "
-		if m.gitMenuCursor == i {
-			cursor = "> "
-		}
-		style := lipgloss.NewStyle().Foreground(lipgloss.Color("255"))
-		if m.gitMenuCursor == i {
-			style = style.Bold(true).Foreground(lipgloss.Color("#FFD700"))
-		}
-		s.WriteString(cursor + style.Render(item) + "\n")
-	}
+	// Viewport (scrollable output)
+	vpStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(0, 1)
+	s.WriteString(vpStyle.Render(m.gitViewport.View()) + "\n\n")
 
-	if m.inputMode == inputGitRemote {
-		s.WriteString("\n  " + m.input.View())
-	}
+	// Input prompt
+	s.WriteString("  " + m.gitInput.View() + "\n\n")
 
-	if m.gitOutput != "" {
-		s.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("─── Output ───") + "\n")
-		// Limit output lines
-		lines := strings.Split(m.gitOutput, "\n")
-		maxLines := 10
-		if maxH > 0 {
-			maxLines = maxH - 10
-		}
-		if maxLines < 3 {
-			maxLines = 3
-		}
-		if len(lines) > maxLines {
-			lines = lines[:maxLines]
-			lines = append(lines, "...")
-		}
-		for _, l := range lines {
-			s.WriteString("  " + l + "\n")
-		}
-	}
-
-	s.WriteString("\n")
-	s.WriteString(faintStyle.Render("  Esc: Back • ↑↓: Nav • Enter: Run"))
+	s.WriteString(faintStyle.Render("  Ctrl+c / Esc: Close • Enter: Run command"))
 }
 
-// ─── MAIN ───
+// ─── HELPERS ────────────────────────────────────────────────────────────────────
+
+func clamp(val, lo, hi int) int {
+	if val < lo {
+		return lo
+	}
+	if val > hi {
+		return hi
+	}
+	return val
+}
+
+// scrollWindow returns the visible [start, end) range for a list of `total`
+// items, keeping `cursor` centered when possible.
+func scrollWindow(cursor, total, maxVisible int) (int, int) {
+	if maxVisible <= 0 {
+		maxVisible = 10
+	}
+	if total <= maxVisible {
+		return 0, total
+	}
+	half := maxVisible / 2
+	start := cursor - half
+	if start < 0 {
+		start = 0
+	}
+	end := start + maxVisible
+	if end > total {
+		end = total
+		start = end - maxVisible
+		if start < 0 {
+			start = 0
+		}
+	}
+	return start, end
+}
+
+// ─── MAIN ───────────────────────────────────────────────────────────────────────
 
 func main() {
+	// Suppress timestamp from git output
+	_ = time.Now()
+
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)
