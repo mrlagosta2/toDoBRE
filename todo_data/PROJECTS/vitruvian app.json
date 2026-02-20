@@ -1,0 +1,77 @@
+{
+  "title": "vitruvian app",
+  "todos": [
+    {
+      "title": "feat: workout tracker",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: nutrition tracker",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: workout + nutrition correlation",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: basic exercise list (maybe api)",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: workout routine creation",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: calendar view",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: graphs with insights",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: todays goal view",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: meal routine creation",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: calorie, macros and water intake tracking",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: weekly and monthly view (with data insights)",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: start menu view",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    }
+  ]
+}

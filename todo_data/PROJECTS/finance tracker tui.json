@@ -1,0 +1,11 @@
+{
+  "title": "finance tracker tui",
+  "todos": [
+    {
+      "title": "feat: conexão com openclaw",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    }
+  ]
+}

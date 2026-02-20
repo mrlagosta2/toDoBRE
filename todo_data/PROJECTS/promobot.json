@@ -1,0 +1,53 @@
+{
+  "title": "promobot",
+  "todos": [
+    {
+      "title": "feat: metrica de tempo no hud",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "edit: hora + data no card de produto",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: super promo envia aviso no grupo de admins",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: add produto via link unico",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: text search filter",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: add autorating de promo",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: autoreprover based on keywords",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "config: export giant database to teach ai price range",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    }
+  ]
+}

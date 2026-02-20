@@ -1,0 +1,93 @@
+{
+  "title": "todo tui",
+  "todos": [
+    {
+      "title": "aprimorar menu git",
+      "done": false,
+      "description": "",
+      "subtasks": [
+        {
+          "title": "selecionar group para ser versionado",
+          "done": false
+        }
+      ]
+    },
+    {
+      "title": "corrigir bug de delecao se rename for igual",
+      "done": true,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "melhorar navegacao subtasks",
+      "done": true,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "tab para toggle de interface",
+      "done": true,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "fix: ordenacao nao esta sendo salva (groups) (ordem alfabetica)",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "fix: done tasks are no longer moved to bottom",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: percentage viewer for tasks and groups (1 casa decimal)",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "fix: subtask rename is going for the task name",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "fix: when add description, \"New subtask name\" appears",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: every workspace should have an 'ALL' group",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: add star to group and \"favorites\" group with all tasks from stared groups",
+      "done": false,
+      "description": "",
+      "subtasks": [
+        {
+          "title": "favorites group per workspace",
+          "done": false
+        },
+        {
+          "title": "favorites group only exists if one or more of the workspace's groups has a star",
+          "done": false
+        },
+        {
+          "title": "simple keybind for staring a group",
+          "done": false
+        },
+        {
+          "title": "favorites group shows origin group [origin]",
+          "done": false
+        }
+      ]
+    }
+  ]
+}

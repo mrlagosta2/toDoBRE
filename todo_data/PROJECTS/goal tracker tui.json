@@ -1,0 +1,29 @@
+{
+  "title": "goal tracker tui",
+  "todos": [
+    {
+      "title": "feat: add goal",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: short-term (specific) and long-term (open) goals",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: short-term to long-term correlation (feeding)",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: mark completion or fail",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    }
+  ]
+}

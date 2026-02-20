@@ -1,0 +1,17 @@
+{
+  "title": "meu bazar app",
+  "todos": [
+    {
+      "title": "feat: input clothing and autooutput result",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    },
+    {
+      "title": "feat: wardrobe (database of clothing made)",
+      "done": false,
+      "description": "",
+      "subtasks": null
+    }
+  ]
+}
