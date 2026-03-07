@@ -27,11 +27,27 @@ type Todo struct {
 	Done        bool      `json:"done"`
 	Description string    `json:"description"`
 	Subtasks    []Subtask `json:"subtasks"`
+	Today       bool      `json:"today,omitempty"`
 }
 
 type GroupFile struct {
 	Title string `json:"title"`
 	Todos []Todo `json:"todos"`
+}
+
+// meta.json per workspace — stores custom group ordering and metadata
+type GroupMeta struct {
+	Name       string `json:"name"`
+	IsFavorite bool   `json:"is_favorite,omitempty"`
+}
+type WorkspaceMeta struct {
+	Groups []GroupMeta `json:"groups"`
+}
+
+type todayEntry struct {
+	workspace string
+	group     string
+	taskIndex int
 }
 
 // Old format for migration
@@ -56,6 +72,7 @@ const (
 	stateViewTasks
 	stateTaskDetails
 	stateGitConsole
+	stateTodayView
 )
 
 type inputTarget int
@@ -71,6 +88,7 @@ const (
 	inputRenameTask
 	inputRenameTaskTitle
 	inputEditDescription
+	inputRenameSubtask
 )
 
 // ─── MODEL ──────────────────────────────────────────────────────────────────────
@@ -83,9 +101,10 @@ type model struct {
 	workspaceCursor  int
 	currentWorkspace string
 
-	groups       []string
-	groupCursor  int
-	currentGroup string
+	groups        []string
+	groupCursor   int
+	currentGroup  string
+	workspaceMeta WorkspaceMeta // loaded alongside groups
 
 	tasks      GroupFile
 	taskCursor int
@@ -97,9 +116,12 @@ type model struct {
 	gitInput    textinput.Model
 	gitHistory  string
 
-	// All view collapse
+	// All/Favorites view collapse
 	collapsed    map[string]bool
 	allViewItems []allViewEntry
+
+	// Today view
+	todayItems []todayEntry
 
 	// Input
 	input         textinput.Model
@@ -179,13 +201,6 @@ func loadWorkspaces() []string {
 	ensureDir(dir)
 	ensureDir(filepath.Join(dir, "HOME"))
 
-	allPath := filepath.Join(dir, "HOME", "ALL.json")
-	if _, err := os.Stat(allPath); os.IsNotExist(err) {
-		g := GroupFile{Title: "ALL", Todos: []Todo{}}
-		data, _ := json.MarshalIndent(g, "", "  ")
-		_ = os.WriteFile(allPath, data, 0644)
-	}
-
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return []string{"HOME"}
@@ -216,47 +231,95 @@ func loadWorkspaces() []string {
 	return ws
 }
 
-func loadGroups(workspace string) []string {
+// ── META.JSON PERSISTENCE ───────────────────────────────────────────────────────
+
+func loadWorkspaceMeta(workspace string) WorkspaceMeta {
+	path := filepath.Join(getDataDir(), workspace, "meta.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return WorkspaceMeta{}
+	}
+	var meta WorkspaceMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return WorkspaceMeta{}
+	}
+	return meta
+}
+
+func saveWorkspaceMeta(workspace string, meta WorkspaceMeta) {
+	dir := filepath.Join(getDataDir(), workspace)
+	ensureDir(dir)
+	data, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, "meta.json"), data, 0644)
+}
+
+func isVirtualGroup(name string) bool {
+	return name == "ALL" || name == "FAVORITES"
+}
+
+// loadGroupsWithMeta reads meta.json for ordering, reconciles with disk files,
+// then injects virtual groups (ALL at 0, FAVORITES at 1 if any favorites exist).
+// Returns the display list and the reconciled meta.
+func loadGroupsWithMeta(workspace string) ([]string, WorkspaceMeta) {
 	dir := filepath.Join(getDataDir(), workspace)
 	ensureDir(dir)
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if workspace == "HOME" {
-			return []string{"ALL"}
-		}
-		return []string{}
-	}
-
-	groups := []string{}
-	hasAll := false
+	// 1. Scan disk for actual .json files (exclude meta.json)
+	entries, _ := os.ReadDir(dir)
+	diskFiles := map[string]bool{}
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
+		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".json") && strings.ToLower(e.Name()) != "meta.json" {
 			name := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
-			if workspace == "HOME" && strings.ToUpper(name) == "ALL" {
-				hasAll = true
-				groups = append(groups, "ALL")
-			} else {
-				groups = append(groups, name)
-			}
+			diskFiles[name] = true
 		}
 	}
 
-	if workspace == "HOME" && !hasAll {
-		groups = append([]string{"ALL"}, groups...)
-		g := GroupFile{Title: "ALL", Todos: []Todo{}}
-		data, _ := json.MarshalIndent(g, "", "  ")
-		_ = os.WriteFile(filepath.Join(dir, "ALL.json"), data, 0644)
-	} else if workspace == "HOME" {
-		sorted := []string{"ALL"}
-		for _, g := range groups {
-			if g != "ALL" {
-				sorted = append(sorted, g)
-			}
+	// 2. Load meta
+	meta := loadWorkspaceMeta(workspace)
+
+	// 3. Reconcile: keep only entries that exist on disk, in meta order
+	reconciled := []GroupMeta{}
+	seen := map[string]bool{}
+	for _, gm := range meta.Groups {
+		if diskFiles[gm.Name] && !isVirtualGroup(gm.Name) {
+			reconciled = append(reconciled, gm)
+			seen[gm.Name] = true
 		}
-		groups = sorted
 	}
-	return groups
+
+	// 4. Append any new files not yet in meta
+	for name := range diskFiles {
+		if !seen[name] && !isVirtualGroup(name) {
+			reconciled = append(reconciled, GroupMeta{Name: name})
+		}
+	}
+
+	meta.Groups = reconciled
+	saveWorkspaceMeta(workspace, meta)
+
+	// 5. Build display list: inject virtual groups
+	groups := []string{"ALL"}
+
+	// Check if any favorites exist
+	hasFav := false
+	for _, gm := range meta.Groups {
+		if gm.IsFavorite {
+			hasFav = true
+			break
+		}
+	}
+	if hasFav {
+		groups = append(groups, "FAVORITES")
+	}
+
+	// Append real groups in meta order
+	for _, gm := range meta.Groups {
+		groups = append(groups, gm.Name)
+	}
+	return groups, meta
 }
 
 func loadGroupFile(workspace, group string) GroupFile {
@@ -326,8 +389,11 @@ func countGroupTasks(workspace, group string) (done, total int) {
 }
 
 func countWorkspaceTasks(workspace string) (done, total int) {
-	groups := loadGroups(workspace)
+	groups, _ := loadGroupsWithMeta(workspace)
 	for _, g := range groups {
+		if isVirtualGroup(g) {
+			continue
+		}
 		d, t := countGroupTasks(workspace, g)
 		done += d
 		total += t
@@ -437,16 +503,44 @@ func (m model) Init() tea.Cmd {
 
 func (m *model) buildAllViewItems() {
 	m.allViewItems = nil
-	groups := loadGroups(m.currentWorkspace)
-	for _, gName := range groups {
-		if gName == "ALL" {
+	for _, gm := range m.workspaceMeta.Groups {
+		gf := loadGroupFile(m.currentWorkspace, gm.Name)
+		m.allViewItems = append(m.allViewItems, allViewEntry{isHeader: true, groupName: gm.Name})
+		if !m.collapsed[gm.Name] {
+			for i := range gf.Todos {
+				m.allViewItems = append(m.allViewItems, allViewEntry{groupName: gm.Name, taskIndex: i})
+			}
+		}
+	}
+}
+
+func (m *model) buildFavViewItems() {
+	m.allViewItems = nil
+	for _, gm := range m.workspaceMeta.Groups {
+		if !gm.IsFavorite {
 			continue
 		}
-		gf := loadGroupFile(m.currentWorkspace, gName)
-		m.allViewItems = append(m.allViewItems, allViewEntry{isHeader: true, groupName: gName})
-		if !m.collapsed[gName] {
+		gf := loadGroupFile(m.currentWorkspace, gm.Name)
+		m.allViewItems = append(m.allViewItems, allViewEntry{isHeader: true, groupName: gm.Name})
+		if !m.collapsed[gm.Name] {
 			for i := range gf.Todos {
-				m.allViewItems = append(m.allViewItems, allViewEntry{groupName: gName, taskIndex: i})
+				m.allViewItems = append(m.allViewItems, allViewEntry{groupName: gm.Name, taskIndex: i})
+			}
+		}
+	}
+}
+
+func (m *model) buildTodayItems() {
+	m.todayItems = nil
+	for _, ws := range m.workspaces {
+		groups, meta := loadGroupsWithMeta(ws)
+		_ = groups
+		for _, gm := range meta.Groups {
+			gf := loadGroupFile(ws, gm.Name)
+			for i, t := range gf.Todos {
+				if t.Today {
+					m.todayItems = append(m.todayItems, todayEntry{workspace: ws, group: gm.Name, taskIndex: i})
+				}
 			}
 		}
 	}
@@ -517,6 +611,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleGroups(msg)
 		case stateViewTasks:
 			return m.handleTasks(msg)
+		case stateTodayView:
+			return m.handleTodayView(msg)
 		}
 	}
 	return m, cmd
@@ -540,7 +636,7 @@ func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if val != "" {
 				gf := GroupFile{Title: val, Todos: []Todo{}}
 				saveGroupFile(m.currentWorkspace, val, gf)
-				m.groups = loadGroups(m.currentWorkspace)
+				m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 			}
 		case inputAddTask:
 			if val != "" {
@@ -567,12 +663,20 @@ func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case inputRenameGroup:
 			if val != "" && m.groupCursor < len(m.groups) {
 				oldName := m.groups[m.groupCursor]
-				if !(m.currentWorkspace == "HOME" && oldName == "ALL") && val != oldName {
+				if !isVirtualGroup(oldName) && val != oldName {
 					gf := loadGroupFile(m.currentWorkspace, oldName)
 					gf.Title = val
 					saveGroupFile(m.currentWorkspace, val, gf)
 					deleteGroupFile(m.currentWorkspace, oldName)
-					m.groups = loadGroups(m.currentWorkspace)
+					// Update meta.json entry name
+					for i, gm := range m.workspaceMeta.Groups {
+						if gm.Name == oldName {
+							m.workspaceMeta.Groups[i].Name = val
+							break
+						}
+					}
+					saveWorkspaceMeta(m.currentWorkspace, m.workspaceMeta)
+					m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 				}
 			}
 		case inputRenameTask, inputRenameTaskTitle:
@@ -587,6 +691,14 @@ func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.taskCursor < len(m.tasks.Todos) {
 				m.tasks.Todos[m.taskCursor].Description = val
 				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+			}
+		case inputRenameSubtask:
+			if val != "" && m.taskCursor < len(m.tasks.Todos) {
+				task := &m.tasks.Todos[m.taskCursor]
+				if m.subtaskCursor < len(task.Subtasks) {
+					task.Subtasks[m.subtaskCursor].Title = val
+					saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+				}
 			}
 		}
 		m.inputMode = inputNone
@@ -620,9 +732,9 @@ func (m model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case stateViewGroups:
 			if m.groupCursor < len(m.groups) {
 				name := m.groups[m.groupCursor]
-				if !(m.currentWorkspace == "HOME" && name == "ALL") {
+				if !isVirtualGroup(name) {
 					deleteGroupFile(m.currentWorkspace, name)
-					m.groups = loadGroups(m.currentWorkspace)
+					m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 					if m.groupCursor >= len(m.groups) {
 						m.groupCursor = len(m.groups) - 1
 					}
@@ -711,7 +823,7 @@ func (m model) handleWorkspaces(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", "right", "l":
 		if m.workspaceCursor < len(m.workspaces) {
 			m.currentWorkspace = m.workspaces[m.workspaceCursor]
-			m.groups = loadGroups(m.currentWorkspace)
+			m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 			m.groupCursor = 0
 			m.state = stateViewGroups
 		}
@@ -742,6 +854,11 @@ func (m model) handleWorkspaces(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.workspaces[m.workspaceCursor], m.workspaces[m.workspaceCursor+1] = m.workspaces[m.workspaceCursor+1], m.workspaces[m.workspaceCursor]
 			m.workspaceCursor++
 		}
+	case "T":
+		// Open Today view
+		m.buildTodayItems()
+		m.taskCursor = 0
+		m.state = stateTodayView
 	}
 	return m, nil
 }
@@ -764,10 +881,14 @@ func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", "right", "l":
 		if m.groupCursor < len(m.groups) {
 			m.currentGroup = m.groups[m.groupCursor]
-			if m.currentWorkspace == "HOME" && m.currentGroup == "ALL" {
+			if m.currentGroup == "ALL" {
 				m.buildAllViewItems()
+			} else if m.currentGroup == "FAVORITES" {
+				m.buildFavViewItems()
 			}
-			m.tasks = loadGroupFile(m.currentWorkspace, m.currentGroup)
+			if !isVirtualGroup(m.currentGroup) {
+				m.tasks = loadGroupFile(m.currentWorkspace, m.currentGroup)
+			}
 			m.taskCursor = 0
 			m.state = stateViewTasks
 		}
@@ -778,50 +899,87 @@ func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.Focus()
 		return m, textinput.Blink
 	case "r":
-		if !(m.currentWorkspace == "HOME" && m.groupCursor == 0) {
+		if m.groupCursor < len(m.groups) && !isVirtualGroup(m.groups[m.groupCursor]) {
 			m.inputMode = inputRenameGroup
 			m.input.SetValue(m.groups[m.groupCursor])
 			m.input.Focus()
 			return m, textinput.Blink
 		}
 	case "ctrl+x":
-		if !(m.currentWorkspace == "HOME" && m.groupCursor == 0) && m.groupCursor < len(m.groups) {
+		if m.groupCursor < len(m.groups) && !isVirtualGroup(m.groups[m.groupCursor]) {
 			m.confirmDelete = true
 		}
-	case "shift+up", "K":
-		minIdx := 0
-		if m.currentWorkspace == "HOME" {
-			minIdx = 1
+	case "f":
+		// Toggle favorite on selected group
+		if m.groupCursor < len(m.groups) && !isVirtualGroup(m.groups[m.groupCursor]) {
+			gName := m.groups[m.groupCursor]
+			for i, gm := range m.workspaceMeta.Groups {
+				if gm.Name == gName {
+					m.workspaceMeta.Groups[i].IsFavorite = !gm.IsFavorite
+					break
+				}
+			}
+			saveWorkspaceMeta(m.currentWorkspace, m.workspaceMeta)
+			m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 		}
-		if m.groupCursor > minIdx {
-			m.groups[m.groupCursor], m.groups[m.groupCursor-1] = m.groups[m.groupCursor-1], m.groups[m.groupCursor]
-			m.groupCursor--
+	case "shift+up", "K":
+		// Only reorder real groups (skip virtual)
+		if m.groupCursor < len(m.groups) && !isVirtualGroup(m.groups[m.groupCursor]) {
+			prev := m.groupCursor - 1
+			if prev >= 0 && !isVirtualGroup(m.groups[prev]) {
+				m.groups[m.groupCursor], m.groups[prev] = m.groups[prev], m.groups[m.groupCursor]
+				m.groupCursor = prev
+				// Persist order: rebuild meta from current groups order
+				m.syncGroupsToMeta()
+			}
 		}
 	case "shift+down", "J":
-		minIdx := 0
-		if m.currentWorkspace == "HOME" {
-			minIdx = 1
-		}
-		if m.groupCursor >= minIdx && m.groupCursor < len(m.groups)-1 {
-			m.groups[m.groupCursor], m.groups[m.groupCursor+1] = m.groups[m.groupCursor+1], m.groups[m.groupCursor]
-			m.groupCursor++
+		if m.groupCursor < len(m.groups) && !isVirtualGroup(m.groups[m.groupCursor]) {
+			next := m.groupCursor + 1
+			if next < len(m.groups) && !isVirtualGroup(m.groups[next]) {
+				m.groups[m.groupCursor], m.groups[next] = m.groups[next], m.groups[m.groupCursor]
+				m.groupCursor = next
+				m.syncGroupsToMeta()
+			}
 		}
 	}
 	return m, nil
 }
 
+// syncGroupsToMeta rebuilds meta group order from the display list (skipping virtual groups)
+func (m *model) syncGroupsToMeta() {
+	// Build a lookup of existing meta entries to preserve IsFavorite etc.
+	metaMap := map[string]GroupMeta{}
+	for _, gm := range m.workspaceMeta.Groups {
+		metaMap[gm.Name] = gm
+	}
+	newOrder := []GroupMeta{}
+	for _, name := range m.groups {
+		if isVirtualGroup(name) {
+			continue
+		}
+		if gm, ok := metaMap[name]; ok {
+			newOrder = append(newOrder, gm)
+		} else {
+			newOrder = append(newOrder, GroupMeta{Name: name})
+		}
+	}
+	m.workspaceMeta.Groups = newOrder
+	saveWorkspaceMeta(m.currentWorkspace, m.workspaceMeta)
+}
+
 // ── TASK HANDLER ────────────────────────────────────────────────────────────────
 
 func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	isAllView := m.currentWorkspace == "HOME" && m.currentGroup == "ALL"
+	isVirtual := isVirtualGroup(m.currentGroup)
 
-	if isAllView {
+	if isVirtual {
 		return m.handleAllViewTasks(msg)
 	}
 
 	switch msg.String() {
 	case "esc", "left", "h":
-		m.groups = loadGroups(m.currentWorkspace)
+		m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 		m.state = stateViewGroups
 	case "up", "k":
 		if m.taskCursor > 0 {
@@ -879,6 +1037,11 @@ func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.taskCursor++
 			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
 		}
+	case "t":
+		if m.taskCursor < len(m.tasks.Todos) {
+			m.tasks.Todos[m.taskCursor].Today = !m.tasks.Todos[m.taskCursor].Today
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
 	}
 	return m, nil
 }
@@ -888,7 +1051,7 @@ func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) handleAllViewTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "left", "h":
-		m.groups = loadGroups(m.currentWorkspace)
+		m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 		m.state = stateViewGroups
 	case "up", "k":
 		if m.taskCursor > 0 {
@@ -903,7 +1066,11 @@ func (m model) handleAllViewTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			entry := m.allViewItems[m.taskCursor]
 			if entry.isHeader {
 				m.collapsed[entry.groupName] = !m.collapsed[entry.groupName]
-				m.buildAllViewItems()
+				if m.currentGroup == "FAVORITES" {
+					m.buildFavViewItems()
+				} else {
+					m.buildAllViewItems()
+				}
 				if m.taskCursor >= len(m.allViewItems) {
 					m.taskCursor = len(m.allViewItems) - 1
 				}
@@ -921,7 +1088,56 @@ func (m model) handleAllViewTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			entry := m.allViewItems[m.taskCursor]
 			if entry.isHeader {
 				m.collapsed[entry.groupName] = !m.collapsed[entry.groupName]
-				m.buildAllViewItems()
+				if m.currentGroup == "FAVORITES" {
+					m.buildFavViewItems()
+				} else {
+					m.buildAllViewItems()
+				}
+			}
+		}
+	}
+	return m, nil
+}
+
+// ── TODAY VIEW HANDLER ──────────────────────────────────────────────────────────
+
+func (m model) handleTodayView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "left", "h":
+		m.state = stateViewWorkspaces
+	case "up", "k":
+		if m.taskCursor > 0 {
+			m.taskCursor--
+		}
+	case "down", "j":
+		if m.taskCursor < len(m.todayItems)-1 {
+			m.taskCursor++
+		}
+	case " ":
+		if m.taskCursor < len(m.todayItems) {
+			e := m.todayItems[m.taskCursor]
+			gf := loadGroupFile(e.workspace, e.group)
+			if e.taskIndex < len(gf.Todos) {
+				gf.Todos[e.taskIndex].Done = !gf.Todos[e.taskIndex].Done
+				saveGroupFile(e.workspace, e.group, gf)
+				m.buildTodayItems()
+				if m.taskCursor >= len(m.todayItems) && m.taskCursor > 0 {
+					m.taskCursor = len(m.todayItems) - 1
+				}
+			}
+		}
+	case "t":
+		// Un-mark from Today
+		if m.taskCursor < len(m.todayItems) {
+			e := m.todayItems[m.taskCursor]
+			gf := loadGroupFile(e.workspace, e.group)
+			if e.taskIndex < len(gf.Todos) {
+				gf.Todos[e.taskIndex].Today = false
+				saveGroupFile(e.workspace, e.group, gf)
+				m.buildTodayItems()
+				if m.taskCursor >= len(m.todayItems) && m.taskCursor > 0 {
+					m.taskCursor = len(m.todayItems) - 1
+				}
 			}
 		}
 	}
@@ -960,12 +1176,25 @@ func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.Focus()
 		return m, textinput.Blink
 	case "r":
+		// Subtask rename if cursor is on a subtask, otherwise rename task title
+		if len(task.Subtasks) > 0 && m.subtaskCursor < len(task.Subtasks) {
+			m.inputMode = inputRenameSubtask
+			m.input.SetValue(task.Subtasks[m.subtaskCursor].Title)
+		} else {
+			m.inputMode = inputRenameTaskTitle
+			m.input.SetValue(task.Title)
+		}
+		m.input.Focus()
+		return m, textinput.Blink
+	case "R":
+		// Always rename the parent task title
 		m.inputMode = inputRenameTaskTitle
 		m.input.SetValue(task.Title)
 		m.input.Focus()
 		return m, textinput.Blink
 	case "d":
 		m.inputMode = inputEditDescription
+		m.input.Placeholder = "Type the description..."
 		m.input.SetValue(task.Description)
 		m.input.Focus()
 		return m, textinput.Blink
@@ -1012,7 +1241,7 @@ func (m model) View() string {
 	case stateViewGroups:
 		m.viewGroups(&s, contentHeight)
 	case stateViewTasks:
-		if m.currentWorkspace == "HOME" && m.currentGroup == "ALL" {
+		if isVirtualGroup(m.currentGroup) {
 			m.viewAllTasks(&s, contentHeight)
 		} else {
 			m.viewTasks(&s, contentHeight)
@@ -1021,6 +1250,8 @@ func (m model) View() string {
 		m.viewTaskDetails(&s, contentHeight)
 	case stateGitConsole:
 		m.viewGitConsole(&s, contentHeight)
+	case stateTodayView:
+		m.viewToday(&s, contentHeight)
 	}
 
 	content := s.String()
@@ -1039,6 +1270,8 @@ func (m model) View() string {
 		borderColor = getColor(m.groupCursor)
 	case stateGitConsole:
 		borderColor = lipgloss.Color("#FFD700")
+	case stateTodayView:
+		borderColor = lipgloss.Color("#00CED1")
 	}
 
 	w := m.width
@@ -1093,7 +1326,7 @@ func (m model) viewWorkspaces(s *strings.Builder, maxH int) {
 	if m.inputMode == inputAddWorkspace || m.inputMode == inputRenameWorkspace {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ↑↓: Nav • →/Enter: Open • n: New • r: Rename • Ctrl+x: Del • g: Git"))
+		s.WriteString(faintStyle.Render("  ↑↓: Nav • →/Enter: Open • n: New • r: Rename • Ctrl+x: Del • T: Today • g: Git"))
 	}
 }
 
@@ -1116,10 +1349,39 @@ func (m model) viewGroups(s *strings.Builder, maxH int) {
 			cursor = "> "
 		}
 
-		done, total := countGroupTasks(m.currentWorkspace, g)
-		label := fmt.Sprintf("%s (%d/%d)", g, done, total)
+		// For virtual groups, show aggregate counts
+		var done, total int
+		if g == "ALL" {
+			done, total = countWorkspaceTasks(m.currentWorkspace)
+		} else if g == "FAVORITES" {
+			for _, gm := range m.workspaceMeta.Groups {
+				if gm.IsFavorite {
+					d, t := countGroupTasks(m.currentWorkspace, gm.Name)
+					done += d
+					total += t
+				}
+			}
+		} else {
+			done, total = countGroupTasks(m.currentWorkspace, g)
+		}
+
+		// Check if group is favorited
+		favStar := ""
+		if !isVirtualGroup(g) {
+			for _, gm := range m.workspaceMeta.Groups {
+				if gm.Name == g && gm.IsFavorite {
+					favStar = " ★"
+					break
+				}
+			}
+		}
+
+		label := fmt.Sprintf("%s (%d/%d)%s", g, done, total, favStar)
 
 		color := getColor(i)
+		if isVirtualGroup(g) {
+			color = lipgloss.Color("250")
+		}
 		style := lipgloss.NewStyle().Foreground(color)
 		if m.groupCursor == i {
 			style = style.Bold(true).Background(lipgloss.Color("236")).Padding(0, 1)
@@ -1141,7 +1403,7 @@ func (m model) viewGroups(s *strings.Builder, maxH int) {
 	if m.inputMode == inputAddGroup || m.inputMode == inputRenameGroup {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ←: Back • ↑↓: Nav • →/Enter: Open • n: New • r: Rename • Ctrl+x: Del"))
+		s.WriteString(faintStyle.Render("  ←: Back • ↑↓: Nav • →/Enter: Open • n: New • r: Rename • f: Fav • Ctrl+x: Del"))
 	}
 }
 
@@ -1209,20 +1471,44 @@ func (m model) viewTasks(s *strings.Builder, maxH int) {
 	}
 
 	s.WriteString("\n")
+
+	// Description preview for selected task
+	if m.taskCursor < len(m.tasks.Todos) {
+		desc := m.tasks.Todos[m.taskCursor].Description
+		if desc != "" {
+			descStyle := lipgloss.NewStyle().Faint(true).Italic(true).
+				Foreground(lipgloss.Color("245")).PaddingLeft(2)
+			lines := strings.SplitN(desc, "\n", 4)
+			if len(lines) > 3 {
+				lines = lines[:3]
+				lines = append(lines, "...")
+			}
+			s.WriteString(descStyle.Render("\U0001F4DD "+strings.Join(lines, "\n   ")) + "\n")
+		}
+		// Today indicator
+		if m.tasks.Todos[m.taskCursor].Today {
+			s.WriteString(lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("#00CED1")).PaddingLeft(2).Render("\U0001F4CC marked for Today") + "\n")
+		}
+	}
+
 	if m.inputMode == inputAddTask || m.inputMode == inputRenameTask {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ←: Back • Space: ✓ • →/Enter: Details • n: New • r: Rename • Ctrl+x: Del • K/J: Reorder"))
+		s.WriteString(faintStyle.Render("  ←: Back • Space: ✓ • →/Enter: Details • n: New • r: Rename • t: Today • Ctrl+x: Del"))
 	}
 }
 
 // ── VIEW: ALL VIEW ──────────────────────────────────────────────────────────────
 
 func (m model) viewAllTasks(s *strings.Builder, maxH int) {
+	viewTitle := "  All Tasks"
+	if m.currentGroup == "FAVORITES" {
+		viewTitle = "  ★ Favorites"
+	}
 	header := lipgloss.JoinHorizontal(lipgloss.Left,
-		titleStyle.Render("  All Tasks"),
+		titleStyle.Render(viewTitle),
 		lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  "),
-		lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Bold(true).Render("HOME"),
+		lipgloss.NewStyle().Foreground(getColor(m.workspaceCursor)).Bold(true).Render(m.currentWorkspace),
 	)
 	s.WriteString(header + "\n\n")
 
@@ -1296,6 +1582,67 @@ func indexOf(slice []string, val string) int {
 	return 0
 }
 
+// ── VIEW: TODAY ──────────────────────────────────────────────────────────────────
+
+func (m model) viewToday(s *strings.Builder, maxH int) {
+	header := titleStyle.Copy().
+		Background(lipgloss.Color("#00CED1")).
+		Foreground(lipgloss.Color("0")).
+		Render("  \U0001F4CC Today")
+	s.WriteString(header + "\n\n")
+
+	if len(m.todayItems) == 0 {
+		s.WriteString(faintStyle.Render("  No tasks marked for today.") + "\n")
+		s.WriteString(faintStyle.Render("  Press 't' on any task to mark it.") + "\n")
+	} else {
+		visibleStart, visibleEnd := scrollWindow(m.taskCursor, len(m.todayItems), maxH-4)
+
+		for i := visibleStart; i < visibleEnd; i++ {
+			e := m.todayItems[i]
+			gf := loadGroupFile(e.workspace, e.group)
+			if e.taskIndex >= len(gf.Todos) {
+				continue
+			}
+			t := gf.Todos[e.taskIndex]
+
+			cursor := "  "
+			if m.taskCursor == i {
+				cursor = "> "
+			}
+
+			check := "[ ]"
+			if t.Done {
+				check = "[x]"
+			}
+
+			context := fmt.Sprintf("[%s > %s]", e.workspace, e.group)
+			contextStyle := lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("245"))
+
+			tStyle := lipgloss.NewStyle()
+			if t.Done {
+				tStyle = tStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
+			} else {
+				tStyle = tStyle.Foreground(lipgloss.Color("255"))
+			}
+
+			if m.taskCursor == i {
+				tStyle = tStyle.Foreground(lipgloss.Color("#00CED1"))
+				cursor = lipgloss.NewStyle().Foreground(lipgloss.Color("#00CED1")).Render(cursor)
+			}
+
+			label := fmt.Sprintf("%s %s %s", check, t.Title, contextStyle.Render(context))
+			s.WriteString(fmt.Sprintf("%s%s\n", cursor, tStyle.Render(label)))
+		}
+
+		if visibleEnd < len(m.todayItems) {
+			s.WriteString(faintStyle.Render(fmt.Sprintf("  ... +%d more", len(m.todayItems)-visibleEnd)) + "\n")
+		}
+	}
+
+	s.WriteString("\n")
+	s.WriteString(faintStyle.Render("  ←/Esc: Back • ↑↓: Nav • Space: ✓ • t: Remove from Today"))
+}
+
 // ── VIEW: TASK DETAILS ──────────────────────────────────────────────────────────
 
 func (m model) viewTaskDetails(s *strings.Builder, maxH int) {
@@ -1347,10 +1694,10 @@ func (m model) viewTaskDetails(s *strings.Builder, maxH int) {
 	}
 
 	s.WriteString("\n")
-	if m.inputMode == inputAddSubtask || m.inputMode == inputRenameTaskTitle || m.inputMode == inputEditDescription {
+	if m.inputMode == inputAddSubtask || m.inputMode == inputRenameTaskTitle || m.inputMode == inputEditDescription || m.inputMode == inputRenameSubtask {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ←/Esc: Back • r: Rename • d: Description • n: Add Subtask • Space: ✓ • Ctrl+x: Del • K/J: Reorder"))
+		s.WriteString(faintStyle.Render("  ←/Esc: Back • r: Rename • R: Rename Task • d: Description • n: Subtask • Space: ✓ • Ctrl+x: Del"))
 	}
 }
 
