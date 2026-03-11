@@ -2,8 +2,7 @@
 
 A minimalist yet powerful Terminal User Interface (TUI) for managing tasks, built with **Go**, **Bubble Tea**, and **Lip Gloss**.
 
-![MAU-toDoTUI](https://charm.sh/img/bubbletea.png)
-*(Note: Replace with actual screenshot if available)*
+![alt text](image.png)
 
 ## ✨ Features
 
