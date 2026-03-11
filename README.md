@@ -7,19 +7,26 @@ A minimalist yet powerful Terminal User Interface (TUI) for managing tasks, buil
 
 ## ✨ Features
 
-- **📂 Group Management**: Organize tasks into custom groups (Work, Personal, etc.).
-- **🌐 "All" Aggregation**: The default "All" group (Index 0) shows every task from every group in one timeline.
-- **🎨 Dynamic Theming**:
-    - Over 20+ distinct pastel and neon colors for groups.
+- **🗂️ 4-Level Data Hierarchy**:
+    - **Workspaces**: High-level directories (e.g., Work, Personal, Projects).
+    - **Groups**: Custom files to categorize your task lists.
+    - **Tasks**: Individual to-dos with detailed descriptions and metadata.
+    - **Subtasks**: Break down complex tasks into easily manageable steps.
+- **🌐 Smart Views & Virtual Groups**:
+    - **"ALL" Group**: An aggregated view of every task across your current workspace.
+    - **"FAVORITES" Group**: Track and pin your favorite groups (Toggle with `f`).
+    - **Global "TODAY" View**: Press `T` from the workspaces view to instantly see all tasks marked for "Today" across all your workspaces.
+- **📝 Rich Task Management**:
+    - **Descriptions**: Add detailed multi-line notes or descriptions to tasks (`d`), previewable directly from the task list.
+    - **Subtasks**: Create, reorder, and toggle individual subtasks for deeper organization.
+    - **Custom Ordering**: Reorder workspaces, groups, tasks, and subtasks seamlessly using `Shift+Up` and `Shift+Down`.
+- **💻 Integrated Git Console**:
+    - Built-in console (`g`) allows you to run git commands (e.g., `git status`, `git commit`) directly within the TUI to transparently version control your task files.
+- **🎨 Dynamic Theming & Views**:
+    - Over 20+ distinct pastel and neon colors for various groups.
     - Borders and highlights dynamically match the active group's color.
-    - The "All" view is neutrally styled (Light Gray) for distinction.
-- **⚡ Smart Sorting**: Active tasks float to the top; Completed tasks sink to the bottom (dimmed).
-- **📝 Full CRUD**:
-    - **Create**: Add new Groups or Tasks instantly.
-    - **Read**: Filter by group or view all.
-    - **Update**: **Rename** groups and tasks in place with context-aware logic.
-    - **Delete**: Safe deletion with confirmation for non-empty groups.
-- **👁️ View Modes**: Toggle between **Full Mode** (Bordered Window) and **Compact Mode** (Inline) using `Tab`.
+    - Toggle between **Full Mode** (Bordered Window) and **Compact Mode** (Inline) instantly using `Tab`.
+    - Smart sorting automatically floats active tasks to the top and sinks completed tasks to the bottom (dimmed).
 
 ---
 
@@ -55,38 +62,45 @@ To run `todo` from anywhere, add the directory containing `todo.exe` to your sys
 
 ## ⌨️ Controls
 
-The application uses **Vim-style** navigation alongside standard Arrow keys.
+The application uses intuitive **Vim-style** navigation alongside standard Arrow keys.
 
-### 🧭 Navigation
-| Key | Action |
-| :--- | :--- |
-| **`Tab`** | **Toggle View Mode** (Full Window / Compact) |
-| **`←`** / **`h`** | Go to **Group List** |
-| **`→`** / **`l`** | Enter **selected Group** (Task View) |
-| **`Enter`** | Enter **selected Group** (Task View) |
-| **`↑`** / **`k`** | Move Cursor Up |
-| **`↓`** / **`j`** | Move Cursor Down |
+### 🧭 Navigation & Views
+| Key | Context | Action |
+| :--- | :--- | :--- |
+| **`Tab`** | Global | **Toggle View Mode** (Full Window / Compact) |
+| **`←`** / **`h`** | Any | Go **Back** / Up a level (e.g., Tasks -> Groups) |
+| **`→`** / **`l`** | Any | **Drill Down** / Enter selected item |
+| **`Enter`** | Any | **Drill Down** (Groups, Tasks, Workspaces, Subtasks) |
+| **`↑`** / **`k`** | Any | Move Cursor **Up** |
+| **`↓`** / **`j`** | Any | Move Cursor **Down** |
+| **`T`** | Workspaces | View Global **Today's Tasks** |
+| **`g`** | Global | Open builtin **Git Console** |
 
 ### ⚡ Actions
 | Key | Context | Action |
 | :--- | :--- | :--- |
-| **`n`** | Any | **New** Group (if in Group List) or Task (if in Task List) |
-| **`r`** | Any | **Rename** Selected Group or Task |
-| **`x`** | Any | **Delete** Selected Item |
-| **`Space`** | Tasks | **Toggle Done/Undone** |
-| **`Ctrl+x`** | Deletion | **Confirm Deletion** (for groups with tasks) |
-| **`Esc`** | Input | **Cancel** Input / Return to List |
+| **`n`** | Any | **New** (Workspace, Group, Task, Subtask) |
+| **`r`** | Any | **Rename** Selected Item (or Subtask) |
+| **`R`** | Task Details | **Rename Parent Task Title** (when highlighting subtasks) |
+| **`d`** | Task Details | Add / Edit **Task Description** |
+| **`f`** | Groups List | Toggle **Favorite** status for a Group |
+| **`t`** | Tasks List | Mark / Unmark Task for **Today** |
+| **`Shift+↑`** / **`K`** | Any | **Move Item Up** (Reorder) |
+| **`Shift+↓`** / **`J`** | Any | **Move Item Down** (Reorder) |
+| **`Space`** | Tasks / Subtasks | **Toggle Done / Undone** |
+| **`ctrl+x`** | Any | **Delete** Selected Item (or confirm deletion) |
+| **`Esc`** | Input / Detail | **Cancel** Input / Return to previous view |
 | **`q`** | Global | **Quit** Application |
 
 ---
 
 ## 💾 Data Persistence
 
-Your data is automatically saved to a JSON file in your user configuration directory:
-- **Windows**: `C:\Users\%USERNAME%\AppData\Roaming\todotui\todos.json`
-- **Linux/Mac**: `~/.config/todotui/todos.json`
+Your data is automatically saved to clear, human-readable JSON files in an organized folder structure inside your user configuration directory:
+- **Windows**: `C:\Users\%USERNAME%\AppData\Roaming\todotui\workspaces\`
+- **Linux/Mac**: `~/.config/todotui/workspaces/`
 
-The file is human-readable and can be backed up or edited manually if needed.
+Each workspace is a directory containing individual `.json` files for groups, along with a `meta.json` file storing your custom order preferences and favorite toggles. The structural simplicity makes it extremely easy to back up or version control via Git.
 
 ---
 
