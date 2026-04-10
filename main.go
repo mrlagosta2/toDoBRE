@@ -470,13 +470,11 @@ func initialModel() model {
 
 	ti := textinput.New()
 	ti.Placeholder = "..."
-	ti.Focus()
 	ti.Prompt = ""
 
 	gi := textinput.New()
 	gi.Placeholder = "command..."
 	gi.Prompt = "git > "
-	gi.Focus()
 	gi.CharLimit = 256
 
 	vp := viewport.New(70, 10)
@@ -552,7 +550,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.quitting {
 		return m, tea.Quit
 	}
-	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -594,8 +591,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.gitViewport.SetContent(lipgloss.NewStyle().Faint(true).Render("  Type a git command and press Enter. (e.g. status, log --oneline -5)"))
 			m.gitViewport.GotoBottom()
 			m.gitInput.Reset()
-			m.gitInput.Focus()
-			return m, textinput.Blink
+			cmd := m.gitInput.Focus()
+			return m, cmd
 		case "tab":
 			m.compactMode = !m.compactMode
 			if m.compactMode {
@@ -614,8 +611,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case stateTodayView:
 			return m.handleTodayView(msg)
 		}
+
+	default:
+		// Forward non-key messages (cursor blink, etc.) to the active input
+		var cmd tea.Cmd
+		if m.inputMode != inputNone {
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+		}
+		if m.state == stateGitConsole {
+			m.gitInput, cmd = m.gitInput.Update(msg)
+			return m, cmd
+		}
 	}
-	return m, cmd
+	return m, nil
 }
 
 // ── INPUT HANDLER ───────────────────────────────────────────────────────────────
@@ -624,6 +633,7 @@ func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEnter:
 		val := strings.TrimSpace(m.input.Value())
+		m.input.Blur()
 
 		switch m.inputMode {
 		case inputAddWorkspace:
@@ -706,6 +716,7 @@ func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEsc:
+		m.input.Blur()
 		m.inputMode = inputNone
 		m.input.Reset()
 		return m, nil
@@ -831,14 +842,14 @@ func (m model) handleWorkspaces(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputMode = inputAddWorkspace
 		m.input.Placeholder = "New Workspace (UPPERCASE)..."
 		m.input.Reset()
-		m.input.Focus()
-		return m, textinput.Blink
+		cmd := m.input.Focus()
+		return m, cmd
 	case "r":
 		if m.workspaceCursor > 0 {
 			m.inputMode = inputRenameWorkspace
 			m.input.SetValue(m.workspaces[m.workspaceCursor])
-			m.input.Focus()
-			return m, textinput.Blink
+			cmd := m.input.Focus()
+			return m, cmd
 		}
 	case "ctrl+x":
 		if m.workspaceCursor > 0 {
@@ -896,14 +907,14 @@ func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputMode = inputAddGroup
 		m.input.Placeholder = "New Group..."
 		m.input.Reset()
-		m.input.Focus()
-		return m, textinput.Blink
+		cmd := m.input.Focus()
+		return m, cmd
 	case "r":
 		if m.groupCursor < len(m.groups) && !isVirtualGroup(m.groups[m.groupCursor]) {
 			m.inputMode = inputRenameGroup
 			m.input.SetValue(m.groups[m.groupCursor])
-			m.input.Focus()
-			return m, textinput.Blink
+			cmd := m.input.Focus()
+			return m, cmd
 		}
 	case "ctrl+x":
 		if m.groupCursor < len(m.groups) && !isVirtualGroup(m.groups[m.groupCursor]) {
@@ -1003,14 +1014,14 @@ func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputMode = inputAddTask
 		m.input.Placeholder = "New Task..."
 		m.input.Reset()
-		m.input.Focus()
-		return m, textinput.Blink
+		cmd := m.input.Focus()
+		return m, cmd
 	case "r":
 		if m.taskCursor < len(m.tasks.Todos) {
 			m.inputMode = inputRenameTask
 			m.input.SetValue(m.tasks.Todos[m.taskCursor].Title)
-			m.input.Focus()
-			return m, textinput.Blink
+			cmd := m.input.Focus()
+			return m, cmd
 		}
 	case "ctrl+x":
 		if m.taskCursor < len(m.tasks.Todos) {
@@ -1173,8 +1184,8 @@ func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.inputMode = inputAddSubtask
 		m.input.Placeholder = "New Subtask..."
 		m.input.Reset()
-		m.input.Focus()
-		return m, textinput.Blink
+		cmd := m.input.Focus()
+		return m, cmd
 	case "r":
 		// Subtask rename if cursor is on a subtask, otherwise rename task title
 		if len(task.Subtasks) > 0 && m.subtaskCursor < len(task.Subtasks) {
@@ -1184,20 +1195,20 @@ func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.inputMode = inputRenameTaskTitle
 			m.input.SetValue(task.Title)
 		}
-		m.input.Focus()
-		return m, textinput.Blink
+		cmd := m.input.Focus()
+		return m, cmd
 	case "R":
 		// Always rename the parent task title
 		m.inputMode = inputRenameTaskTitle
 		m.input.SetValue(task.Title)
-		m.input.Focus()
-		return m, textinput.Blink
+		cmd := m.input.Focus()
+		return m, cmd
 	case "d":
 		m.inputMode = inputEditDescription
 		m.input.Placeholder = "Type the description..."
 		m.input.SetValue(task.Description)
-		m.input.Focus()
-		return m, textinput.Blink
+		cmd := m.input.Focus()
+		return m, cmd
 	case "ctrl+x":
 		if m.subtaskCursor < len(task.Subtasks) {
 			task.Subtasks = append(task.Subtasks[:m.subtaskCursor], task.Subtasks[m.subtaskCursor+1:]...)
