@@ -83,6 +83,7 @@ The application uses intuitive **Vim-style** navigation alongside standard Arrow
 | **`R`** | Task Details | **Rename Parent Task Title** (when highlighting subtasks) |
 | **`d`** | Task Details | Add / Edit **Task Description** |
 | **`f`** | Groups List | Toggle **Favorite** status for a Group |
+| **`c`** | Groups List | **Randomize / Reroll Color** for a Group |
 | **`t`** | Tasks List | Mark / Unmark Task for **Today** |
 | **`Shift+↑`** / **`K`** | Any | **Move Item Up** (Reorder) |
 | **`Shift+↓`** / **`J`** | Any | **Move Item Down** (Reorder) |
@@ -115,3 +116,9 @@ Each workspace is a directory containing individual `.json` files for groups, al
 ## 📄 License
 
 MIT License. Free to use and modify.
+
+---
+
+## 🐛 Changelog
+
+- **Fix**: Corrected a visual bug where completed tasks and subtasks became unreadable on certain terminal profiles by removing `Faint` styling and using a lighter gray color.

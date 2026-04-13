@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -37,8 +38,9 @@ type GroupFile struct {
 
 // meta.json per workspace — stores custom group ordering and metadata
 type GroupMeta struct {
-	Name       string `json:"name"`
-	IsFavorite bool   `json:"is_favorite,omitempty"`
+	Name        string `json:"name"`
+	IsFavorite  bool   `json:"is_favorite,omitempty"`
+	ColorOffset int    `json:"color_offset,omitempty"`
 }
 type WorkspaceMeta struct {
 	Groups []GroupMeta `json:"groups"`
@@ -171,7 +173,24 @@ func getColor(index int) lipgloss.Color {
 	if index <= 0 {
 		return lipgloss.Color("250")
 	}
-	return palette[(index-1)%len(palette)]
+	idx := (index - 1) % len(palette)
+	if idx < 0 {
+		idx += len(palette)
+	}
+	return palette[idx]
+}
+
+func (m model) getGroupColor(index int, groupName string) lipgloss.Color {
+	offset := 0
+	if !isVirtualGroup(groupName) {
+		for _, gm := range m.workspaceMeta.Groups {
+			if gm.Name == groupName {
+				offset = gm.ColorOffset
+				break
+			}
+		}
+	}
+	return getColor(index + offset)
 }
 
 // ─── PERSISTENCE ────────────────────────────────────────────────────────────────
@@ -933,6 +952,19 @@ func (m model) handleGroups(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			saveWorkspaceMeta(m.currentWorkspace, m.workspaceMeta)
 			m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 		}
+	case "c":
+		// Randomize color for selected group
+		if m.groupCursor < len(m.groups) && !isVirtualGroup(m.groups[m.groupCursor]) {
+			gName := m.groups[m.groupCursor]
+			for i, gm := range m.workspaceMeta.Groups {
+				if gm.Name == gName {
+					m.workspaceMeta.Groups[i].ColorOffset += rand.Intn(len(palette)-1) + 1
+					break
+				}
+			}
+			saveWorkspaceMeta(m.currentWorkspace, m.workspaceMeta)
+			m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
+		}
 	case "shift+up", "K":
 		// Only reorder real groups (skip virtual)
 		if m.groupCursor < len(m.groups) && !isVirtualGroup(m.groups[m.groupCursor]) {
@@ -1278,7 +1310,7 @@ func (m model) View() string {
 	case stateViewGroups:
 		borderColor = getColor(m.workspaceCursor)
 	case stateViewTasks, stateTaskDetails:
-		borderColor = getColor(m.groupCursor)
+		borderColor = m.getGroupColor(m.groupCursor, m.currentGroup)
 	case stateGitConsole:
 		borderColor = lipgloss.Color("#FFD700")
 	case stateTodayView:
@@ -1389,7 +1421,7 @@ func (m model) viewGroups(s *strings.Builder, maxH int) {
 
 		label := fmt.Sprintf("%s (%d/%d)%s", g, done, total, favStar)
 
-		color := getColor(i)
+		color := m.getGroupColor(i, g)
 		if isVirtualGroup(g) {
 			color = lipgloss.Color("250")
 		}
@@ -1414,14 +1446,14 @@ func (m model) viewGroups(s *strings.Builder, maxH int) {
 	if m.inputMode == inputAddGroup || m.inputMode == inputRenameGroup {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ←: Back • ↑↓: Nav • →/Enter: Open • n: New • r: Rename • f: Fav • Ctrl+x: Del"))
+		s.WriteString(faintStyle.Render("  ←: Back • ↑↓: Nav • Enter: Open • n: New • r: Rename • f: Fav • c: Color • Ctrl+x: Del"))
 	}
 }
 
 // ── VIEW: TASKS ─────────────────────────────────────────────────────────────────
 
 func (m model) viewTasks(s *strings.Builder, maxH int) {
-	color := getColor(m.groupCursor)
+	color := m.getGroupColor(m.groupCursor, m.currentGroup)
 	header := lipgloss.JoinHorizontal(lipgloss.Left,
 		titleStyle.Render("  Tasks"),
 		lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  "),
@@ -1458,7 +1490,7 @@ func (m model) viewTasks(s *strings.Builder, maxH int) {
 
 			tStyle := lipgloss.NewStyle()
 			if t.Done {
-				tStyle = tStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
+				tStyle = tStyle.Strikethrough(true).Foreground(lipgloss.Color("246"))
 			} else {
 				tStyle = tStyle.Foreground(lipgloss.Color("255"))
 			}
@@ -1542,7 +1574,7 @@ func (m model) viewAllTasks(s *strings.Builder, maxH int) {
 				}
 				done, total := countGroupTasks(m.currentWorkspace, entry.groupName)
 				gIdx := indexOf(m.groups, entry.groupName)
-				color := getColor(gIdx)
+				color := m.getGroupColor(gIdx, entry.groupName)
 				style := lipgloss.NewStyle().Foreground(color).Bold(true)
 				if m.taskCursor == i {
 					style = style.Background(lipgloss.Color("236")).Padding(0, 1)
@@ -1559,12 +1591,12 @@ func (m model) viewAllTasks(s *strings.Builder, maxH int) {
 					}
 					tStyle := lipgloss.NewStyle()
 					if t.Done {
-						tStyle = tStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
+						tStyle = tStyle.Strikethrough(true).Foreground(lipgloss.Color("246"))
 					} else {
 						tStyle = tStyle.Foreground(lipgloss.Color("255"))
 					}
 					gIdx := indexOf(m.groups, entry.groupName)
-					color := getColor(gIdx)
+					color := m.getGroupColor(gIdx, entry.groupName)
 					if m.taskCursor == i {
 						tStyle = tStyle.Foreground(color)
 						cursor = lipgloss.NewStyle().Foreground(color).Render(cursor)
@@ -1631,7 +1663,7 @@ func (m model) viewToday(s *strings.Builder, maxH int) {
 
 			tStyle := lipgloss.NewStyle()
 			if t.Done {
-				tStyle = tStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
+				tStyle = tStyle.Strikethrough(true).Foreground(lipgloss.Color("246"))
 			} else {
 				tStyle = tStyle.Foreground(lipgloss.Color("255"))
 			}
@@ -1662,7 +1694,7 @@ func (m model) viewTaskDetails(s *strings.Builder, maxH int) {
 		return
 	}
 	task := m.tasks.Todos[m.taskCursor]
-	color := getColor(m.groupCursor)
+	color := m.getGroupColor(m.groupCursor, m.currentGroup)
 
 	s.WriteString(titleStyle.Render("  Task Details") + "\n\n")
 
@@ -1693,7 +1725,7 @@ func (m model) viewTaskDetails(s *strings.Builder, maxH int) {
 			}
 			stStyle := lipgloss.NewStyle()
 			if st.Done {
-				stStyle = stStyle.Strikethrough(true).Faint(true).Foreground(lipgloss.Color("240"))
+				stStyle = stStyle.Strikethrough(true).Foreground(lipgloss.Color("246"))
 			} else {
 				stStyle = stStyle.Foreground(lipgloss.Color("255"))
 			}
