@@ -685,27 +685,44 @@ func (m model) handleInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				if newName != oldName {
 					oldPath := filepath.Join(getDataDir(), oldName)
 					newPath := filepath.Join(getDataDir(), newName)
-					_ = os.Rename(oldPath, newPath)
-					m.workspaces = loadWorkspaces()
+					err := os.Rename(oldPath, newPath)
+					if err == nil {
+						backup := getBackupDir()
+						if backup != "" {
+							_ = os.Rename(filepath.Join(backup, oldName), filepath.Join(backup, newName))
+						}
+						m.workspaces = loadWorkspaces()
+					}
 				}
 			}
 		case inputRenameGroup:
 			if val != "" && m.groupCursor < len(m.groups) {
 				oldName := m.groups[m.groupCursor]
 				if !isVirtualGroup(oldName) && val != oldName {
-					gf := loadGroupFile(m.currentWorkspace, oldName)
-					gf.Title = val
-					saveGroupFile(m.currentWorkspace, val, gf)
-					deleteGroupFile(m.currentWorkspace, oldName)
-					// Update meta.json entry name
-					for i, gm := range m.workspaceMeta.Groups {
-						if gm.Name == oldName {
-							m.workspaceMeta.Groups[i].Name = val
-							break
+					oldPath := filepath.Join(getDataDir(), m.currentWorkspace, oldName+".json")
+					newPath := filepath.Join(getDataDir(), m.currentWorkspace, val+".json")
+					err := os.Rename(oldPath, newPath)
+					if err == nil {
+						backup := getBackupDir()
+						if backup != "" {
+							bDir := filepath.Join(backup, m.currentWorkspace)
+							_ = os.Rename(filepath.Join(bDir, oldName+".json"), filepath.Join(bDir, val+".json"))
 						}
+
+						gf := loadGroupFile(m.currentWorkspace, val)
+						gf.Title = val
+						saveGroupFile(m.currentWorkspace, val, gf)
+
+						// Update meta.json entry name
+						for i, gm := range m.workspaceMeta.Groups {
+							if gm.Name == oldName {
+								m.workspaceMeta.Groups[i].Name = val
+								break
+							}
+						}
+						saveWorkspaceMeta(m.currentWorkspace, m.workspaceMeta)
+						m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 					}
-					saveWorkspaceMeta(m.currentWorkspace, m.workspaceMeta)
-					m.groups, m.workspaceMeta = loadGroupsWithMeta(m.currentWorkspace)
 				}
 			}
 		case inputRenameTask, inputRenameTaskTitle:

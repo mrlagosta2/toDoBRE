@@ -121,4 +121,5 @@ MIT License. Free to use and modify.
 
 ## 🐛 Changelog
 
+- **Fix**: Corrected a critical data loss bug on Windows where renaming a workspace or group (specially applying only case changes) caused the original file to be overridden and then deleted immediately.
 - **Fix**: Corrected a visual bug where completed tasks and subtasks became unreadable on certain terminal profiles by removing `Faint` styling and using a lighter gray color.
