@@ -26,6 +26,14 @@ A minimalist yet powerful Terminal User Interface (TUI) for managing tasks, buil
     - Borders and highlights dynamically match the active group's color.
     - Toggle between **Full Mode** (Bordered Window) and **Compact Mode** (Inline) instantly using `Tab`.
     - Smart sorting automatically floats active tasks to the top and sinks completed tasks to the bottom (dimmed).
+- **🤖 AI Agent Integration** (OpenAI GPT-4o-mini):
+    - **AI Chat Panel** (`a` from Task Details): Full-screen conversational AI assistant embedded in the TUI, with task-aware context.
+    - **Proactive Analysis**: On first open, the AI automatically analyzes the task and asks clarifying questions if it's vague.
+    - **Subtask Breakdown**: Ask the AI to break down a task into actionable subtasks — confirm and they're auto-created in the app.
+    - **Step-by-Step Guidance**: The AI can walk you through a task one step at a time.
+    - **Priority Recommendation** (`A` from Tasks List): AI analyzes all tasks in the group and recommends which to do first.
+    - **Persistent Conversations**: Chat history is saved per task and persists across sessions.
+    - **Fully Optional**: Works without AI — set `ai_enabled: false` or simply don't configure an API key.
 
 ---
 
@@ -85,11 +93,13 @@ The application uses intuitive **Vim-style** navigation alongside standard Arrow
 | **`f`** | Groups List | Toggle **Favorite** status for a Group |
 | **`c`** | Groups List | **Randomize / Reroll Color** for a Group |
 | **`t`** | Tasks List | Mark / Unmark Task for **Today** |
+| **`A`** | Tasks List | **AI Priority Recommendation** (which task to do first) |
+| **`a`** | Task Details | Open **AI Agent Panel** (chat with AI about this task) |
 | **`Shift+↑`** / **`K`** | Any | **Move Item Up** (Reorder) |
 | **`Shift+↓`** / **`J`** | Any | **Move Item Down** (Reorder) |
 | **`Space`** | Tasks / Subtasks | **Toggle Done / Undone** |
 | **`ctrl+x`** | Any | **Delete** Selected Item (or confirm deletion) |
-| **`Esc`** | Input / Detail | **Cancel** Input / Return to previous view |
+| **`Esc`** | Input / Detail / AI | **Cancel** Input / Return to previous view |
 | **`q`** | Global | **Quit** Application |
 
 ---
@@ -104,12 +114,68 @@ Each workspace is a directory containing individual `.json` files for groups, al
 
 ---
 
+## 🤖 AI Configuration
+
+The AI features are powered by OpenAI's API (defaulting to the lightweight and extremely fast `gpt-4o-mini`). To enable them:
+
+### Option 1: Environment Variable
+Set the environment variable in your terminal before launching the application:
+- **Windows (PowerShell)**:
+  ```powershell
+  $env:OPENAI_API_KEY="sk-your-key-here"
+  ```
+- **Linux/Mac/Git Bash**:
+  ```bash
+  export OPENAI_API_KEY="sk-your-key-here"
+  ```
+
+### Option 2: Persistent Config File (Recommended)
+Create a `config.json` file inside your user config directory:
+- **Windows**: `C:\Users\<YourUsername>\AppData\Roaming\todotui\config.json` (or `%APPDATA%\todotui\config.json`)
+- **Linux/Mac**: `~/.config/todotui/config.json`
+
+File structure:
+```json
+{
+  "openai_api_key": "sk-your-key-here",
+  "openai_model": "gpt-4o-mini",
+  "ai_enabled": true
+}
+```
+
+If no API key is configured, pressing `a` or `A` shows a friendly error message inline, and the application remains 100% functional without AI features.
+
+---
+
+## 🧠 AI Agent & Productivity Companion
+
+MAU-toDoTUI features an embedded AI assistant that acts as a proactive productivity companion directly inside the terminal. It features full contextual awareness and deep integration with your task database.
+
+### 💬 Conversational Task Assistant (`a` from Task Details)
+Pressing **`a`** while viewing any task's details opens a full-screen, custom-themed interactive AI panel. The AI is initialized with complete details about the workspace, current group, parent task title, description, and list of existing subtasks.
+
+*   **Proactive Task Analysis**: On first open, the AI automatically analyzes the task. If the title is vague or lacks description, it will ask 2-3 target questions to clarify the scope. If the task is already clear, it provides a brief analysis and suggests next steps.
+*   **Automated Subtask Breakdown & Database Sync**: You can ask the AI to break down your task into actionable subtasks. When the AI outputs proposed subtasks in the `[SUBTASKS]` block format, the application **automatically parses them** and offers you an interactive option to instantly inject them as live, functional subtasks in the app!
+    *   *Example prompt*: "break this down into subtasks"
+    *   *System flow*: The AI responds, and you simply type "sim" or "yes" to have them auto-created in your task database immediately.
+*   **Step-by-Step Guidance**: Type "bora" or "começar" and the AI will guide you through the task one step at a time, keeping track of your progress.
+*   **Persistent Task Conversations**: Chat history is saved per-task and persisted directly inside the task's JSON file. You can close the panel, close the app, and resume your exact conversation with the AI later.
+*   **Navigation & Scrolling**: Use **`↑` / `↓`** arrows to scroll through long chat histories, **`Enter`** to send messages, and **`Esc`** to return to the task details view.
+
+### 🎯 Smart Priority Recommendation (`A` from Tasks List)
+Pressing **`A`** while viewing any group's task list triggers an overlay modal where the AI analyzes all tasks in the current group.
+*   The AI evaluates completed vs. pending tasks, tasks marked for **Today**, title context, and description metadata.
+*   It returns a concise 5-6 line recommendation in Portuguese proposing exactly which task to tackle first and the reasoning behind it (considering urgency, value, and dependencies).
+
+---
+
 ## 🛠️ Built With
 
 - **Language**: [Go](https://go.dev/)
 - **TUI Framework**: [Bubble Tea](https://github.com/charmbracelet/bubbletea)
 - **Styling**: [Lip Gloss](https://github.com/charmbracelet/lipgloss)
 - **Input Components**: [Bubbles](https://github.com/charmbracelet/bubbles)
+- **AI**: [OpenAI API](https://platform.openai.com/) (GPT-4o-mini, via standard `net/http`)
 
 ---
 
@@ -121,5 +187,6 @@ MIT License. Free to use and modify.
 
 ## 🐛 Changelog
 
+- **Feature**: Added AI Agent integration with OpenAI GPT-4o-mini — chat panel (`a`), priority recommendations (`A`), subtask auto-creation, proactive task analysis, and persistent conversations per task.
 - **Fix**: Corrected a critical data loss bug on Windows where renaming a workspace or group (specially applying only case changes) caused the original file to be overridden and then deleted immediately.
 - **Fix**: Corrected a visual bug where completed tasks and subtasks became unreadable on certain terminal profiles by removing `Faint` styling and using a lighter gray color.

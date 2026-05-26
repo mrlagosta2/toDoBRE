@@ -10,10 +10,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"todotui/ai"
 )
 
 // ─── DATA STRUCTURES ───────────────────────────────────────────────────────────
@@ -23,12 +26,19 @@ type Subtask struct {
 	Done  bool   `json:"done"`
 }
 
+// AIMessage represents a single message in the AI conversation history.
+type AIMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 type Todo struct {
-	Title       string    `json:"title"`
-	Done        bool      `json:"done"`
-	Description string    `json:"description"`
-	Subtasks    []Subtask `json:"subtasks"`
-	Today       bool      `json:"today,omitempty"`
+	Title          string      `json:"title"`
+	Done           bool        `json:"done"`
+	Description    string      `json:"description"`
+	Subtasks       []Subtask   `json:"subtasks"`
+	Today          bool        `json:"today,omitempty"`
+	AIConversation []AIMessage `json:"ai_conversation,omitempty"`
 }
 
 type GroupFile struct {
@@ -75,6 +85,8 @@ const (
 	stateTaskDetails
 	stateGitConsole
 	stateTodayView
+	stateAIPanel
+	stateAIPriorityModal
 )
 
 type inputTarget int
@@ -130,6 +142,19 @@ type model struct {
 	inputMode     inputTarget
 	adding        bool
 	confirmDelete bool
+
+	// AI Agent Panel
+	aiInput          textinput.Model
+	aiMessages       []AIMessage  // current task's conversation (mirrors task.AIConversation)
+	aiScrollOffset   int
+	aiWaiting        bool         // true while waiting for API response
+	aiSpinner        spinner.Model
+	aiConfig         ai.Config    // loaded on startup
+	aiPendingSubtasks []string    // parsed subtasks awaiting user confirmation
+
+	// AI Priority Modal
+	aiPriorityResult string // the AI's priority recommendation text
+	aiPriorityError  string
 
 	// Display
 	compactMode bool
@@ -491,6 +516,15 @@ func initialModel() model {
 	ti.Placeholder = "..."
 	ti.Prompt = ""
 
+	aiTi := textinput.New()
+	aiTi.Placeholder = "Pergunte ao agente AI..."
+	aiTi.Prompt = "Você > "
+	aiTi.CharLimit = 500
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700"))
+
 	gi := textinput.New()
 	gi.Placeholder = "command..."
 	gi.Prompt = "git > "
@@ -506,6 +540,9 @@ func initialModel() model {
 		workspaces:       ws,
 		currentWorkspace: "HOME",
 		input:            ti,
+		aiInput:          aiTi,
+		aiSpinner:        sp,
+		aiConfig:         ai.LoadConfig(),
 		gitInput:         gi,
 		gitViewport:      vp,
 		collapsed:        make(map[string]bool),
@@ -563,6 +600,70 @@ func (m *model) buildTodayItems() {
 	}
 }
 
+// ─── AI MESSAGE TYPES ───────────────────────────────────────────────────────────
+
+// aiResponseMsg is returned by the async OpenAI call for the chat panel.
+type aiResponseMsg struct {
+	Content string
+	Err     error
+}
+
+// aiPriorityResponseMsg is returned by the async OpenAI call for priority recommendation.
+type aiPriorityResponseMsg struct {
+	Content string
+	Err     error
+}
+
+// sendAIRequest returns a tea.Cmd that calls the OpenAI API asynchronously.
+func sendAIRequest(config ai.Config, messages []ai.ChatMessage) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := ai.CallOpenAI(config.OpenAIAPIKey, config.OpenAIModel, messages)
+		if err != nil {
+			return aiResponseMsg{Err: err}
+		}
+		return aiResponseMsg{Content: resp}
+	}
+}
+
+// sendAIPriorityRequest returns a tea.Cmd for the priority recommendation.
+func sendAIPriorityRequest(config ai.Config, messages []ai.ChatMessage) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := ai.CallOpenAI(config.OpenAIAPIKey, config.OpenAIModel, messages)
+		if err != nil {
+			return aiPriorityResponseMsg{Err: err}
+		}
+		return aiPriorityResponseMsg{Content: resp}
+	}
+}
+
+// buildAIChatMessages converts model state into the []ai.ChatMessage slice
+// needed for the OpenAI API call, including the system prompt.
+func (m model) buildAIChatMessages() []ai.ChatMessage {
+	task := m.tasks.Todos[m.taskCursor]
+
+	// Build subtask info
+	subtaskInfos := make([]ai.SubtaskInfo, len(task.Subtasks))
+	for i, st := range task.Subtasks {
+		subtaskInfos[i] = ai.SubtaskInfo{Title: st.Title, Done: st.Done}
+	}
+
+	systemPrompt := ai.BuildTaskSystemPrompt(
+		m.currentWorkspace, m.currentGroup,
+		task.Title, task.Description, subtaskInfos,
+	)
+
+	msgs := []ai.ChatMessage{
+		{Role: "system", Content: systemPrompt},
+	}
+
+	// Add conversation history
+	for _, msg := range m.aiMessages {
+		msgs = append(msgs, ai.ChatMessage{Role: msg.Role, Content: msg.Content})
+	}
+
+	return msgs
+}
+
 // ─── UPDATE ─────────────────────────────────────────────────────────────────────
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -581,6 +682,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.gitViewport.Height = vpH
 		return m, nil
 
+	case aiResponseMsg:
+		m.aiWaiting = false
+		if msg.Err != nil {
+			// Show error as a system message in the chat
+			m.aiMessages = append(m.aiMessages, AIMessage{Role: "system", Content: "⚠ " + msg.Err.Error()})
+		} else {
+			m.aiMessages = append(m.aiMessages, AIMessage{Role: "assistant", Content: msg.Content})
+			// Check if AI proposed subtasks
+			proposed := ai.ParseSubtaskProposal(msg.Content)
+			if len(proposed) > 0 {
+				m.aiPendingSubtasks = proposed
+			}
+		}
+		// Persist conversation to task
+		if m.taskCursor < len(m.tasks.Todos) {
+			m.tasks.Todos[m.taskCursor].AIConversation = m.aiMessages
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+		}
+		// Auto-scroll to bottom
+		m.aiScrollOffset = 0
+		return m, nil
+
+	case aiPriorityResponseMsg:
+		m.aiWaiting = false
+		if msg.Err != nil {
+			m.aiPriorityError = msg.Err.Error()
+			m.aiPriorityResult = ""
+		} else {
+			m.aiPriorityResult = msg.Content
+			m.aiPriorityError = ""
+		}
+		return m, nil
+
+	case spinner.TickMsg:
+		if m.aiWaiting {
+			var cmd tea.Cmd
+			m.aiSpinner, cmd = m.aiSpinner.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		// ── INPUT MODE ──
 		if m.inputMode != inputNone {
@@ -589,6 +731,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ── CONFIRM DELETE ──
 		if m.confirmDelete {
 			return m.handleConfirmDelete(msg)
+		}
+		// ── AI PANEL ──
+		if m.state == stateAIPanel {
+			return m.handleAIPanel(msg)
+		}
+		// ── AI PRIORITY MODAL ──
+		if m.state == stateAIPriorityModal {
+			return m.handleAIPriorityModal(msg)
 		}
 		// ── GIT CONSOLE ──
 		if m.state == stateGitConsole {
@@ -640,6 +790,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.state == stateGitConsole {
 			m.gitInput, cmd = m.gitInput.Update(msg)
+			return m, cmd
+		}
+		if m.state == stateAIPanel {
+			m.aiInput, cmd = m.aiInput.Update(msg)
 			return m, cmd
 		}
 	}
@@ -1102,6 +1256,35 @@ func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.tasks.Todos[m.taskCursor].Today = !m.tasks.Todos[m.taskCursor].Today
 			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
 		}
+	case "A":
+		// AI Priority Recommendation
+		if !m.aiConfig.AIEnabled {
+			return m, nil
+		}
+		if m.aiConfig.OpenAIAPIKey == "" {
+			m.aiPriorityError = "AI não configurada. Defina OPENAI_API_KEY ou adicione a chave no config.json"
+			m.aiPriorityResult = ""
+			m.state = stateAIPriorityModal
+			return m, nil
+		}
+		if len(m.tasks.Todos) == 0 {
+			return m, nil
+		}
+		// Build task info list
+		taskInfos := make([]ai.TaskInfo, len(m.tasks.Todos))
+		for i, t := range m.tasks.Todos {
+			taskInfos[i] = ai.TaskInfo{Title: t.Title, Done: t.Done, Today: t.Today}
+		}
+		sysPrompt := ai.BuildPrioritySystemPrompt(m.currentWorkspace, m.currentGroup, taskInfos)
+		msgs := []ai.ChatMessage{
+			{Role: "system", Content: sysPrompt},
+			{Role: "user", Content: "Qual tarefa devo fazer primeiro e por quê?"},
+		}
+		m.aiWaiting = true
+		m.aiPriorityResult = ""
+		m.aiPriorityError = ""
+		m.state = stateAIPriorityModal
+		return m, tea.Batch(sendAIPriorityRequest(m.aiConfig, msgs), m.aiSpinner.Tick)
 	}
 	return m, nil
 }
@@ -1278,7 +1461,130 @@ func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.subtaskCursor++
 			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
 		}
+	case "a":
+		// Open AI Agent Panel
+		if !m.aiConfig.AIEnabled {
+			return m, nil
+		}
+		if m.aiConfig.OpenAIAPIKey == "" {
+			// Show error as a message in the AI panel
+			m.aiMessages = []AIMessage{
+				{Role: "system", Content: "⚠ AI não configurada. Defina OPENAI_API_KEY ou adicione a chave no config.json"},
+			}
+			m.aiPendingSubtasks = nil
+			m.aiScrollOffset = 0
+			m.aiInput.Reset()
+			m.state = stateAIPanel
+			cmd := m.aiInput.Focus()
+			return m, cmd
+		}
+		// Load existing conversation from task
+		m.aiMessages = task.AIConversation
+		if m.aiMessages == nil {
+			m.aiMessages = []AIMessage{}
+		}
+		m.aiPendingSubtasks = nil
+		m.aiScrollOffset = 0
+		m.aiInput.Reset()
+		m.state = stateAIPanel
+		cmd := m.aiInput.Focus()
+
+		// If fresh conversation, trigger proactive AI analysis
+		if len(m.aiMessages) == 0 {
+			initMsg := ai.BuildInitialAnalysisMessage()
+			m.aiMessages = append(m.aiMessages, AIMessage{Role: "user", Content: initMsg})
+			m.aiWaiting = true
+			apiMsgs := m.buildAIChatMessages()
+			return m, tea.Batch(cmd, sendAIRequest(m.aiConfig, apiMsgs), m.aiSpinner.Tick)
+		}
+		return m, cmd
 	}
+	return m, nil
+}
+
+// ── AI PANEL HANDLER ────────────────────────────────────────────────────────────
+
+func (m model) handleAIPanel(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.aiInput.Blur()
+		m.state = stateTaskDetails
+		return m, nil
+	case tea.KeyEnter:
+		if m.aiWaiting {
+			// Don't send while waiting for response
+			return m, nil
+		}
+		userText := strings.TrimSpace(m.aiInput.Value())
+		if userText == "" {
+			return m, nil
+		}
+		m.aiInput.Reset()
+
+		// Check if user is confirming pending subtasks
+		if len(m.aiPendingSubtasks) > 0 && ai.IsConfirmation(userText) {
+			// Add subtasks programmatically
+			if m.taskCursor < len(m.tasks.Todos) {
+				for _, title := range m.aiPendingSubtasks {
+					m.tasks.Todos[m.taskCursor].Subtasks = append(
+						m.tasks.Todos[m.taskCursor].Subtasks,
+						Subtask{Title: title, Done: false},
+					)
+				}
+				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+
+				// Add confirmation message to chat
+				confirmMsg := fmt.Sprintf("✅ %d subtarefas adicionadas com sucesso!", len(m.aiPendingSubtasks))
+				m.aiMessages = append(m.aiMessages, AIMessage{Role: "user", Content: userText})
+				m.aiMessages = append(m.aiMessages, AIMessage{Role: "system", Content: confirmMsg})
+				m.aiPendingSubtasks = nil
+
+				// Persist conversation
+				m.tasks.Todos[m.taskCursor].AIConversation = m.aiMessages
+				saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+			}
+			m.aiScrollOffset = 0
+			return m, nil
+		}
+
+		// Normal message — send to AI
+		m.aiPendingSubtasks = nil
+		m.aiMessages = append(m.aiMessages, AIMessage{Role: "user", Content: userText})
+		m.aiWaiting = true
+		apiMsgs := m.buildAIChatMessages()
+		return m, tea.Batch(sendAIRequest(m.aiConfig, apiMsgs), m.aiSpinner.Tick)
+
+	case tea.KeyUp:
+		// Scroll up in conversation
+		m.aiScrollOffset++
+		return m, nil
+	case tea.KeyDown:
+		// Scroll down in conversation
+		if m.aiScrollOffset > 0 {
+			m.aiScrollOffset--
+		}
+		return m, nil
+	}
+
+	// Forward other keys to text input
+	var cmd tea.Cmd
+	m.aiInput, cmd = m.aiInput.Update(msg)
+	return m, cmd
+}
+
+// ── AI PRIORITY MODAL HANDLER ───────────────────────────────────────────────────
+
+func (m model) handleAIPriorityModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.aiWaiting {
+		// While waiting, only allow Esc to cancel
+		if msg.Type == tea.KeyEsc {
+			m.aiWaiting = false
+			m.state = stateViewTasks
+		}
+		return m, nil
+	}
+	// Any key closes the modal
+	m.state = stateViewTasks
 	return m, nil
 }
 
@@ -1312,6 +1618,10 @@ func (m model) View() string {
 		m.viewGitConsole(&s, contentHeight)
 	case stateTodayView:
 		m.viewToday(&s, contentHeight)
+	case stateAIPanel:
+		m.viewAIPanel(&s, contentHeight)
+	case stateAIPriorityModal:
+		m.viewAIPriorityModal(&s, contentHeight)
 	}
 
 	content := s.String()
@@ -1332,6 +1642,8 @@ func (m model) View() string {
 		borderColor = lipgloss.Color("#FFD700")
 	case stateTodayView:
 		borderColor = lipgloss.Color("#00CED1")
+	case stateAIPanel, stateAIPriorityModal:
+		borderColor = m.getGroupColor(m.groupCursor, m.currentGroup)
 	}
 
 	w := m.width
@@ -1554,7 +1866,7 @@ func (m model) viewTasks(s *strings.Builder, maxH int) {
 	if m.inputMode == inputAddTask || m.inputMode == inputRenameTask {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ←: Back • Space: ✓ • →/Enter: Details • n: New • r: Rename • t: Today • Ctrl+x: Del"))
+		s.WriteString(faintStyle.Render("  ←: Back • Space: ✓ • →/Enter: Details • n: New • r: Rename • t: Today • A: AI Priority • Ctrl+x: Del"))
 	}
 }
 
@@ -1757,7 +2069,7 @@ func (m model) viewTaskDetails(s *strings.Builder, maxH int) {
 	if m.inputMode == inputAddSubtask || m.inputMode == inputRenameTaskTitle || m.inputMode == inputEditDescription || m.inputMode == inputRenameSubtask {
 		s.WriteString("  " + m.input.View())
 	} else {
-		s.WriteString(faintStyle.Render("  ←/Esc: Back • r: Rename • R: Rename Task • d: Description • n: Subtask • Space: ✓ • Ctrl+x: Del"))
+		s.WriteString(faintStyle.Render("  ←/Esc: Back • r: Rename • R: Rename Task • d: Description • n: Subtask • a: AI Agent • Space: ✓ • Ctrl+x: Del"))
 	}
 }
 
@@ -1781,6 +2093,168 @@ func (m model) viewGitConsole(s *strings.Builder, maxH int) {
 	s.WriteString("  " + m.gitInput.View() + "\n\n")
 
 	s.WriteString(faintStyle.Render("  Ctrl+c / Esc: Close • Enter: Run command"))
+}
+
+// ── VIEW: AI PANEL ──────────────────────────────────────────────────────────────
+
+func (m model) viewAIPanel(s *strings.Builder, maxH int) {
+	color := m.getGroupColor(m.groupCursor, m.currentGroup)
+
+	// Header with breadcrumb
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		titleStyle.Render("  🤖 AI Agent"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  "),
+		lipgloss.NewStyle().Foreground(color).Bold(true).Render(
+			m.currentWorkspace+" > "+m.currentGroup,
+		),
+	)
+	s.WriteString(header + "\n")
+
+	// Task title context
+	if m.taskCursor < len(m.tasks.Todos) {
+		taskTitle := m.tasks.Todos[m.taskCursor].Title
+		s.WriteString(lipgloss.NewStyle().Faint(true).PaddingLeft(2).Render("Tarefa: "+taskTitle) + "\n")
+	}
+	s.WriteString("\n")
+
+	// Calculate available height for messages
+	// Reserve: header(2) + task context(1) + blank(1) + input(1) + help(1) + blank(1) = 7
+	msgHeight := maxH - 7
+	if msgHeight < 3 {
+		msgHeight = 3
+	}
+
+	// Build message lines
+	var msgLines []string
+	for _, msg := range m.aiMessages {
+		// Skip the hidden initial analysis message
+		if msg.Role == "user" && msg.Content == ai.BuildInitialAnalysisMessage() {
+			continue
+		}
+
+		var prefix string
+		var style lipgloss.Style
+
+		switch msg.Role {
+		case "user":
+			prefix = "  Você > "
+			style = lipgloss.NewStyle().Foreground(color)
+		case "assistant":
+			prefix = "  AI > "
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		case "system":
+			prefix = "  "
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFA500")).Italic(true)
+		}
+
+		// Word-wrap long messages
+		content := msg.Content
+		// Strip [SUBTASKS]...[/SUBTASKS] tags for display
+		content = strings.ReplaceAll(content, "[SUBTASKS]", "")
+		content = strings.ReplaceAll(content, "[/SUBTASKS]", "")
+
+		contentLines := strings.Split(content, "\n")
+		for j, line := range contentLines {
+			if j == 0 {
+				msgLines = append(msgLines, style.Render(prefix+line))
+			} else {
+				// Continuation lines with indent
+				indent := strings.Repeat(" ", len(prefix))
+				msgLines = append(msgLines, style.Render(indent+line))
+			}
+		}
+		msgLines = append(msgLines, "") // blank line between messages
+	}
+
+	// Show spinner if waiting
+	if m.aiWaiting {
+		spinnerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700"))
+		msgLines = append(msgLines, spinnerStyle.Render("  "+m.aiSpinner.View()+" Pensando..."))
+	}
+
+	// Apply scroll offset and visible window
+	totalLines := len(msgLines)
+	visibleEnd := totalLines - m.aiScrollOffset
+	if visibleEnd < 0 {
+		visibleEnd = 0
+	}
+	visibleStart := visibleEnd - msgHeight
+	if visibleStart < 0 {
+		visibleStart = 0
+	}
+	if visibleEnd > totalLines {
+		visibleEnd = totalLines
+	}
+
+	// Clamp scroll offset
+	maxScroll := totalLines - msgHeight
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.aiScrollOffset > maxScroll {
+		m.aiScrollOffset = maxScroll
+	}
+
+	// Render visible messages
+	renderedLines := 0
+	for i := visibleStart; i < visibleEnd; i++ {
+		s.WriteString(msgLines[i] + "\n")
+		renderedLines++
+	}
+
+	// Pad remaining space
+	for renderedLines < msgHeight {
+		s.WriteString("\n")
+		renderedLines++
+	}
+
+	// Scroll indicator
+	if m.aiScrollOffset > 0 {
+		s.WriteString(faintStyle.Render(fmt.Sprintf("  ↑ %d linhas acima", m.aiScrollOffset)) + "\n")
+	}
+
+	// Input area with separator
+	sepStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	s.WriteString(sepStyle.Render("  ────────────────────────────────────────") + "\n")
+	s.WriteString("  " + m.aiInput.View() + "\n")
+
+	// Help
+	s.WriteString(faintStyle.Render("  Enter: Enviar • Esc: Fechar • ↑↓: Rolar"))
+}
+
+// ── VIEW: AI PRIORITY MODAL ─────────────────────────────────────────────────────
+
+func (m model) viewAIPriorityModal(s *strings.Builder, maxH int) {
+	color := m.getGroupColor(m.groupCursor, m.currentGroup)
+
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		titleStyle.Render("  🎯 Recomendação de Prioridade"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  "),
+		lipgloss.NewStyle().Foreground(color).Bold(true).Render(m.currentGroup),
+	)
+	s.WriteString(header + "\n\n")
+
+	if m.aiWaiting {
+		// Show spinner while waiting
+		spinnerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700"))
+		s.WriteString(spinnerStyle.Render("  "+m.aiSpinner.View()+" Analisando tarefas...") + "\n\n")
+		s.WriteString(faintStyle.Render("  Esc: Cancelar"))
+		return
+	}
+
+	if m.aiPriorityError != "" {
+		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6347"))
+		s.WriteString(errStyle.Render("  ⚠ "+m.aiPriorityError) + "\n\n")
+	} else if m.aiPriorityResult != "" {
+		resultStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).PaddingLeft(2)
+		lines := strings.Split(m.aiPriorityResult, "\n")
+		for _, line := range lines {
+			s.WriteString(resultStyle.Render(line) + "\n")
+		}
+		s.WriteString("\n")
+	}
+
+	s.WriteString(faintStyle.Render("  Pressione qualquer tecla para fechar"))
 }
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────────
