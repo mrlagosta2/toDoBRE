@@ -74,6 +74,12 @@ type OldAppState struct {
 	LastGroup string    `json:"last_group"`
 }
 
+type undoState struct {
+	workspace string
+	group     string
+	tasks     GroupFile
+}
+
 // ─── STATE MACHINE ──────────────────────────────────────────────────────────────
 
 type sessionState int
@@ -87,6 +93,9 @@ const (
 	stateTodayView
 	stateAIPanel
 	stateAIPriorityModal
+	stateAIGlobalConsole
+	stateAIScanModal
+	stateAIConfirmAction
 )
 
 type inputTarget int
@@ -155,6 +164,20 @@ type model struct {
 	// AI Priority Modal
 	aiPriorityResult string // the AI's priority recommendation text
 	aiPriorityError  string
+
+	// AI Global Console
+	aiGlobalError string
+
+	// AI Scan Modal
+	aiScanResult      string
+	aiScanError       string
+	aiScanSuggestions []ai.ScanSuggestion
+	aiScanCursor      int
+
+	pendingAction *ai.ParsedAction
+
+	// Undo Stack
+	undoStack []undoState
 
 	// Display
 	compactMode bool
@@ -418,6 +441,52 @@ func deleteWorkspace(name string) {
 	backup := getBackupDir()
 	if backup != "" {
 		_ = os.RemoveAll(filepath.Join(backup, name))
+	}
+}
+
+func (m *model) pushUndoState() {
+	if m.currentWorkspace == "" || m.currentGroup == "" || isVirtualGroup(m.currentGroup) {
+		return
+	}
+	// Deep copy via JSON
+	data, err := json.Marshal(m.tasks)
+	if err != nil {
+		return
+	}
+	var copiedGroup GroupFile
+	json.Unmarshal(data, &copiedGroup)
+
+	state := undoState{
+		workspace: m.currentWorkspace,
+		group:     m.currentGroup,
+		tasks:     copiedGroup,
+	}
+	m.undoStack = append(m.undoStack, state)
+	// keep last 20 states
+	if len(m.undoStack) > 20 {
+		m.undoStack = m.undoStack[1:]
+	}
+}
+
+func (m *model) popUndoState() {
+	if len(m.undoStack) == 0 {
+		return
+	}
+	last := m.undoStack[len(m.undoStack)-1]
+	m.undoStack = m.undoStack[:len(m.undoStack)-1]
+
+	// Restore file
+	saveGroupFile(last.workspace, last.group, last.tasks)
+	
+	// If we are currently in that workspace/group, reload tasks
+	if m.currentWorkspace == last.workspace && m.currentGroup == last.group {
+		m.tasks = last.tasks
+		if m.taskCursor >= len(m.tasks.Todos) {
+			m.taskCursor = len(m.tasks.Todos) - 1
+			if m.taskCursor < 0 {
+				m.taskCursor = 0
+			}
+		}
 	}
 }
 
@@ -715,6 +784,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case aiScanResponseMsg:
+		m.aiWaiting = false
+		if msg.Err != nil {
+			m.aiScanError = msg.Err.Error()
+			m.aiScanResult = ""
+		} else {
+			m.aiScanResult = msg.Content
+			m.aiScanError = ""
+			m.aiScanSuggestions = ai.ParseScanResponse(msg.Content)
+			m.aiScanCursor = 0
+		}
+		return m, nil
+
+	case aiGlobalResponseMsg:
+		m.aiWaiting = false
+		if msg.Err != nil {
+			m.aiGlobalError = msg.Err.Error()
+		} else {
+			m.aiGlobalError = ""
+			m.aiMessages = append(m.aiMessages, AIMessage{Role: "assistant", Content: msg.Content})
+			m.aiScrollOffset = 0
+			// Parse action
+			action := ai.ParseAction(msg.Content)
+			if action != nil {
+				m.pendingAction = action
+				m.prevState = m.state // stateAIGlobalConsole
+				m.state = stateAIConfirmAction
+			}
+		}
+		return m, nil
+
 	case spinner.TickMsg:
 		if m.aiWaiting {
 			var cmd tea.Cmd
@@ -740,6 +840,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state == stateAIPriorityModal {
 			return m.handleAIPriorityModal(msg)
 		}
+		// ── AI SCAN MODAL ──
+		if m.state == stateAIScanModal {
+			return m.handleAIScanModal(msg)
+		}
+		// ── AI GLOBAL CONSOLE ──
+		if m.state == stateAIGlobalConsole {
+			return m.handleAIGlobalConsole(msg)
+		}
+		// ── AI CONFIRM ACTION ──
+		if m.state == stateAIConfirmAction {
+			return m.handleAIConfirmAction(msg)
+		}
 		// ── GIT CONSOLE ──
 		if m.state == stateGitConsole {
 			return m.handleGitConsole(msg)
@@ -753,6 +865,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c":
 			m.quitting = true
 			return m, tea.Quit
+		case "u":
+			m.popUndoState()
+			return m, nil
+		case "C":
+			if !m.aiConfig.AIEnabled {
+				return m, nil
+			}
+			if m.aiConfig.OpenAIAPIKey == "" {
+				m.aiGlobalError = "AI não configurada. Defina OPENAI_API_KEY ou adicione a chave no config.json"
+			} else {
+				m.aiGlobalError = ""
+			}
+			m.prevState = m.state
+			m.state = stateAIGlobalConsole
+			m.aiInput.Reset()
+			cmd := m.aiInput.Focus()
+			return m, cmd
 		case "g":
 			m.prevState = m.state
 			m.state = stateGitConsole
@@ -792,7 +921,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.gitInput, cmd = m.gitInput.Update(msg)
 			return m, cmd
 		}
-		if m.state == stateAIPanel {
+		if m.state == stateAIPanel || m.state == stateAIGlobalConsole {
 			m.aiInput, cmd = m.aiInput.Update(msg)
 			return m, cmd
 		}
@@ -943,6 +1072,7 @@ func (m model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case stateViewTasks:
 			if m.taskCursor < len(m.tasks.Todos) {
+				m.pushUndoState()
 				m.tasks.Todos = append(m.tasks.Todos[:m.taskCursor], m.tasks.Todos[m.taskCursor+1:]...)
 				if m.taskCursor >= len(m.tasks.Todos) && m.taskCursor > 0 {
 					m.taskCursor--
@@ -953,6 +1083,7 @@ func (m model) handleConfirmDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.taskCursor < len(m.tasks.Todos) {
 				task := &m.tasks.Todos[m.taskCursor]
 				if m.subtaskCursor < len(task.Subtasks) {
+					m.pushUndoState()
 					task.Subtasks = append(task.Subtasks[:m.subtaskCursor], task.Subtasks[m.subtaskCursor+1:]...)
 					if m.subtaskCursor >= len(task.Subtasks) && m.subtaskCursor > 0 {
 						m.subtaskCursor--
@@ -1232,6 +1363,7 @@ func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.confirmDelete = true
 			} else {
 				// Direct delete for tasks without subtasks
+				m.pushUndoState()
 				m.tasks.Todos = append(m.tasks.Todos[:m.taskCursor], m.tasks.Todos[m.taskCursor+1:]...)
 				if m.taskCursor >= len(m.tasks.Todos) && m.taskCursor > 0 {
 					m.taskCursor--
@@ -1285,6 +1417,34 @@ func (m model) handleTasks(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.aiPriorityError = ""
 		m.state = stateAIPriorityModal
 		return m, tea.Batch(sendAIPriorityRequest(m.aiConfig, msgs), m.aiSpinner.Tick)
+	case "S":
+		// AI Task Scanner
+		if !m.aiConfig.AIEnabled {
+			return m, nil
+		}
+		if m.aiConfig.OpenAIAPIKey == "" {
+			m.aiScanError = "AI não configurada. Defina OPENAI_API_KEY ou adicione a chave no config.json"
+			m.aiScanResult = ""
+			m.state = stateAIScanModal
+			return m, nil
+		}
+		if len(m.tasks.Todos) == 0 {
+			return m, nil
+		}
+		taskInfos := make([]ai.TaskInfo, len(m.tasks.Todos))
+		for i, t := range m.tasks.Todos {
+			taskInfos[i] = ai.TaskInfo{Title: t.Title, Done: t.Done, Today: t.Today}
+		}
+		sysPrompt := ai.BuildScanSystemPrompt(m.currentWorkspace, m.currentGroup, taskInfos)
+		msgs := []ai.ChatMessage{
+			{Role: "system", Content: sysPrompt},
+			{Role: "user", Content: "Por favor, analise essas tarefas e sugira melhorias ou divisão de subtarefas."},
+		}
+		m.aiWaiting = true
+		m.aiScanResult = ""
+		m.aiScanError = ""
+		m.state = stateAIScanModal
+		return m, tea.Batch(sendAIScanRequest(m.aiConfig, msgs), m.aiSpinner.Tick)
 	}
 	return m, nil
 }
@@ -1443,6 +1603,7 @@ func (m model) handleTaskDetails(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case "ctrl+x":
 		if m.subtaskCursor < len(task.Subtasks) {
+			m.pushUndoState()
 			task.Subtasks = append(task.Subtasks[:m.subtaskCursor], task.Subtasks[m.subtaskCursor+1:]...)
 			if m.subtaskCursor >= len(task.Subtasks) && m.subtaskCursor > 0 {
 				m.subtaskCursor--
@@ -1588,6 +1749,204 @@ func (m model) handleAIPriorityModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// ── AI SCAN MODAL HANDLER ───────────────────────────────────────────────────────
+
+func (m model) handleAIScanModal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.aiWaiting {
+		if msg.Type == tea.KeyEsc {
+			m.aiWaiting = false
+			m.state = stateViewTasks
+		}
+		return m, nil
+	}
+	
+	if msg.Type == tea.KeyEsc {
+		m.state = stateViewTasks
+		return m, nil
+	}
+
+	if len(m.aiScanSuggestions) > 0 {
+		switch msg.String() {
+		case "up", "k":
+			if m.aiScanCursor > 0 {
+				m.aiScanCursor--
+			}
+		case "down", "j":
+			if m.aiScanCursor < len(m.aiScanSuggestions)-1 {
+				m.aiScanCursor++
+			}
+		case "enter":
+			sug := m.aiScanSuggestions[m.aiScanCursor]
+			m.applyScanSuggestion(sug)
+			m.aiScanSuggestions = append(m.aiScanSuggestions[:m.aiScanCursor], m.aiScanSuggestions[m.aiScanCursor+1:]...)
+			if m.aiScanCursor >= len(m.aiScanSuggestions) && m.aiScanCursor > 0 {
+				m.aiScanCursor--
+			}
+		}
+	} else if msg.Type == tea.KeyEnter {
+		m.state = stateViewTasks
+	}
+
+	return m, nil
+}
+
+func (m *model) applyScanSuggestion(sug ai.ScanSuggestion) {
+	m.pushUndoState()
+	for i, t := range m.tasks.Todos {
+		if t.Title == sug.OriginalTitle {
+			if sug.Type == "RENAME" {
+				m.tasks.Todos[i].Title = sug.Suggestion
+			} else if sug.Type == "SUBTASKS" {
+				subNames := strings.Split(sug.Suggestion, "|")
+				for _, sn := range subNames {
+					m.tasks.Todos[i].Subtasks = append(m.tasks.Todos[i].Subtasks, Subtask{Title: sn, Done: false})
+				}
+			}
+			saveGroupFile(m.currentWorkspace, m.currentGroup, m.tasks)
+			break
+		}
+	}
+}
+
+// ── AI CONFIRM ACTION HANDLER ───────────────────────────────────────────────────
+
+func (m model) handleAIConfirmAction(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	str := strings.ToLower(msg.String())
+	if str == "y" || str == "s" {
+		m.executePendingAction()
+		m.pendingAction = nil
+		m.state = m.prevState // return to global console
+		m.aiMessages = append(m.aiMessages, AIMessage{Role: "system", Content: "Ação executada com sucesso. Informe ao usuário e continue."})
+		// Auto-send a message to update the AI on the success
+		apiMsgs := make([]ai.ChatMessage, len(m.aiMessages))
+		for i, ms := range m.aiMessages {
+			apiMsgs[i] = ai.ChatMessage{Role: ms.Role, Content: ms.Content}
+		}
+		m.aiWaiting = true
+		return m, tea.Batch(sendAIGlobalRequest(m.aiConfig, apiMsgs), m.aiSpinner.Tick)
+	} else if str == "n" || msg.Type == tea.KeyEsc {
+		m.pendingAction = nil
+		m.state = m.prevState // return to global console
+		m.aiMessages = append(m.aiMessages, AIMessage{Role: "system", Content: "O usuário recusou a execução da ação."})
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *model) executePendingAction() {
+	if m.pendingAction == nil {
+		return
+	}
+	action := m.pendingAction
+
+	// Check if group exists
+	groupExists := false
+	for _, g := range m.groups {
+		if g == action.Group {
+			groupExists = true
+			break
+		}
+	}
+	if !groupExists {
+		return
+	}
+	gf := loadGroupFile(m.currentWorkspace, action.Group)
+
+	switch action.Type {
+	case "ADD_TASK":
+		m.pushUndoState()
+		gf.Todos = append(gf.Todos, Todo{Title: action.Title})
+		saveGroupFile(m.currentWorkspace, action.Group, gf)
+	case "DELETE_TASK":
+		m.pushUndoState()
+		for i, t := range gf.Todos {
+			if t.Title == action.Title {
+				gf.Todos = append(gf.Todos[:i], gf.Todos[i+1:]...)
+				saveGroupFile(m.currentWorkspace, action.Group, gf)
+				break
+			}
+		}
+	case "RENAME_TASK":
+		m.pushUndoState()
+		for i, t := range gf.Todos {
+			if t.Title == action.OldTitle {
+				gf.Todos[i].Title = action.NewTitle
+				saveGroupFile(m.currentWorkspace, action.Group, gf)
+				break
+			}
+		}
+	case "MARK_DONE":
+		m.pushUndoState()
+		for i, t := range gf.Todos {
+			if t.Title == action.Title {
+				gf.Todos[i].Done = true
+				saveGroupFile(m.currentWorkspace, action.Group, gf)
+				break
+			}
+		}
+	}
+
+	if m.currentGroup == action.Group {
+		m.tasks = gf
+	}
+}
+
+// ── GLOBAL AI CONSOLE HANDLER ───────────────────────────────────────────────────
+
+func (m model) handleAIGlobalConsole(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.aiInput.Blur()
+		m.state = m.prevState
+		return m, nil
+	case tea.KeyEnter:
+		if m.aiWaiting {
+			return m, nil
+		}
+		userText := strings.TrimSpace(m.aiInput.Value())
+		if userText == "" {
+			return m, nil
+		}
+		m.aiInput.Reset()
+		
+		if len(m.aiMessages) == 0 {
+			allTasks := make(map[string][]ai.TaskInfo)
+			for _, g := range m.groups {
+				if isVirtualGroup(g) {
+					continue
+				}
+				gf := loadGroupFile(m.currentWorkspace, g)
+				var tasks []ai.TaskInfo
+				for _, t := range gf.Todos {
+					tasks = append(tasks, ai.TaskInfo{Title: t.Title, Done: t.Done, Today: t.Today})
+				}
+				allTasks[g] = tasks
+			}
+			m.aiMessages = append(m.aiMessages, AIMessage{Role: "system", Content: ai.BuildOmniSystemPrompt(m.workspaces, m.currentWorkspace, m.currentGroup, allTasks)})
+		}
+		m.aiMessages = append(m.aiMessages, AIMessage{Role: "user", Content: userText})
+		m.aiWaiting = true
+		
+		apiMsgs := make([]ai.ChatMessage, len(m.aiMessages))
+		for i, ms := range m.aiMessages {
+			apiMsgs[i] = ai.ChatMessage{Role: ms.Role, Content: ms.Content}
+		}
+
+		return m, tea.Batch(sendAIGlobalRequest(m.aiConfig, apiMsgs), m.aiSpinner.Tick)
+	case tea.KeyUp:
+		m.aiScrollOffset++
+		return m, nil
+	case tea.KeyDown:
+		if m.aiScrollOffset > 0 {
+			m.aiScrollOffset--
+		}
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.aiInput, cmd = m.aiInput.Update(msg)
+	return m, cmd
+}
+
 // ─── VIEW ───────────────────────────────────────────────────────────────────────
 
 func (m model) View() string {
@@ -1622,6 +1981,12 @@ func (m model) View() string {
 		m.viewAIPanel(&s, contentHeight)
 	case stateAIPriorityModal:
 		m.viewAIPriorityModal(&s, contentHeight)
+	case stateAIScanModal:
+		m.viewAIScanModal(&s, contentHeight)
+	case stateAIGlobalConsole:
+		m.viewAIGlobalConsole(&s, contentHeight)
+	case stateAIConfirmAction:
+		m.viewAIConfirmAction(&s, contentHeight)
 	}
 
 	content := s.String()
@@ -1642,7 +2007,7 @@ func (m model) View() string {
 		borderColor = lipgloss.Color("#FFD700")
 	case stateTodayView:
 		borderColor = lipgloss.Color("#00CED1")
-	case stateAIPanel, stateAIPriorityModal:
+	case stateAIPanel, stateAIPriorityModal, stateAIScanModal, stateAIGlobalConsole, stateAIConfirmAction:
 		borderColor = m.getGroupColor(m.groupCursor, m.currentGroup)
 	}
 
@@ -2255,6 +2620,201 @@ func (m model) viewAIPriorityModal(s *strings.Builder, maxH int) {
 	}
 
 	s.WriteString(faintStyle.Render("  Pressione qualquer tecla para fechar"))
+}
+
+// ── VIEW: AI SCAN MODAL ─────────────────────────────────────────────────────────
+
+func (m model) viewAIScanModal(s *strings.Builder, maxH int) {
+	color := m.getGroupColor(m.groupCursor, m.currentGroup)
+
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		titleStyle.Render("  🔍 Scanner Inteligente de Tarefas"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("240")).Render("  "),
+		lipgloss.NewStyle().Foreground(color).Bold(true).Render(m.currentGroup),
+	)
+	s.WriteString(header + "\n\n")
+
+	if m.aiWaiting {
+		spinnerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700"))
+		s.WriteString(spinnerStyle.Render("  "+m.aiSpinner.View()+" Escaneando tarefas e gerando sugestões...") + "\n\n")
+		s.WriteString(faintStyle.Render("  Esc: Cancelar"))
+		return
+	}
+
+	if m.aiScanError != "" {
+		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6347"))
+		s.WriteString(errStyle.Render("  ⚠ "+m.aiScanError) + "\n\n")
+	} else if len(m.aiScanSuggestions) > 0 {
+		s.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render("Sugestões encontradas:") + "\n\n")
+		for i, sug := range m.aiScanSuggestions {
+			cursor := "  "
+			itemStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+			if i == m.aiScanCursor {
+				cursor = "▶ "
+				itemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Bold(true)
+			}
+			s.WriteString(itemStyle.Render(fmt.Sprintf("%s%s", cursor, sug.OriginalTitle)) + "\n")
+			
+			actionText := ""
+			if sug.Type == "RENAME" {
+				actionText = "Renomear para: " + sug.Suggestion
+			} else {
+				actionText = "Criar subtarefas: " + strings.ReplaceAll(sug.Suggestion, "|", ", ")
+			}
+			s.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("62")).PaddingLeft(4).Render(actionText) + "\n\n")
+		}
+	} else {
+		resultStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).PaddingLeft(2)
+		s.WriteString(resultStyle.Render("Nenhuma sugestão ou todas as sugestões foram aplicadas.") + "\n\n")
+	}
+
+	s.WriteString(faintStyle.Render("  Enter: Aplicar selecionada • Esc: Fechar • ↑↓: Navegar"))
+}
+
+// ── VIEW: GLOBAL AI CONSOLE ─────────────────────────────────────────────────────
+
+func (m model) viewAIGlobalConsole(s *strings.Builder, maxH int) {
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		titleStyle.Render("  🌍 Console Global da IA (Omni-chat)"),
+	)
+	s.WriteString(header + "\n\n")
+
+	msgHeight := maxH - 5
+	if msgHeight < 3 {
+		msgHeight = 3
+	}
+
+	var msgLines []string
+	for _, msg := range m.aiMessages {
+		if msg.Role == "system" {
+			continue
+		}
+		var prefix string
+		var style lipgloss.Style
+		switch msg.Role {
+		case "user":
+			prefix = "  Você > "
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("62"))
+		case "assistant":
+			prefix = "  AI > "
+			style = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+		}
+
+		contentLines := strings.Split(msg.Content, "\n")
+		for j, line := range contentLines {
+			if j == 0 {
+				msgLines = append(msgLines, style.Render(prefix+line))
+			} else {
+				indent := strings.Repeat(" ", len(prefix))
+				msgLines = append(msgLines, style.Render(indent+line))
+			}
+		}
+		msgLines = append(msgLines, "")
+	}
+
+	if m.aiGlobalError != "" {
+		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF6347"))
+		msgLines = append(msgLines, errStyle.Render("  ⚠ "+m.aiGlobalError))
+	}
+
+	if m.aiWaiting {
+		spinnerStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFD700"))
+		msgLines = append(msgLines, spinnerStyle.Render("  "+m.aiSpinner.View()+" Executando..."))
+	}
+
+	totalLines := len(msgLines)
+	visibleEnd := totalLines - m.aiScrollOffset
+	if visibleEnd < 0 {
+		visibleEnd = 0
+	}
+	visibleStart := visibleEnd - msgHeight
+	if visibleStart < 0 {
+		visibleStart = 0
+	}
+	if visibleEnd > totalLines {
+		visibleEnd = totalLines
+	}
+
+	maxScroll := totalLines - msgHeight
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.aiScrollOffset > maxScroll {
+		m.aiScrollOffset = maxScroll
+	}
+
+	renderedLines := 0
+	for i := visibleStart; i < visibleEnd; i++ {
+		s.WriteString(msgLines[i] + "\n")
+		renderedLines++
+	}
+	for renderedLines < msgHeight {
+		s.WriteString("\n")
+		renderedLines++
+	}
+
+	if m.aiScrollOffset > 0 {
+		s.WriteString(faintStyle.Render(fmt.Sprintf("  ↑ %d linhas acima", m.aiScrollOffset)) + "\n")
+	}
+
+	sepStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	s.WriteString(sepStyle.Render("  ────────────────────────────────────────") + "\n")
+	s.WriteString("  " + m.aiInput.View() + "\n")
+	s.WriteString(faintStyle.Render("  Enter: Enviar • Esc: Fechar • ↑↓: Rolar"))
+}
+
+// ── VIEW: AI CONFIRM ACTION ─────────────────────────────────────────────────────
+
+func (m model) viewAIConfirmAction(s *strings.Builder, maxH int) {
+	color := lipgloss.Color("#FF6347") // red for caution
+
+	header := lipgloss.JoinHorizontal(lipgloss.Left,
+		titleStyle.Render("  ⚠ Confirmação de Ação da IA"),
+	)
+	s.WriteString(header + "\n\n")
+
+	if m.pendingAction != nil {
+		actionStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("252")).PaddingLeft(2)
+		s.WriteString(actionStyle.Render("A IA deseja executar a seguinte ação:") + "\n\n")
+		
+		s.WriteString(actionStyle.Render(fmt.Sprintf("Tipo:  %s", m.pendingAction.Type)) + "\n")
+		s.WriteString(actionStyle.Render(fmt.Sprintf("Grupo: %s", m.pendingAction.Group)) + "\n")
+		
+		switch m.pendingAction.Type {
+		case "ADD_TASK", "DELETE_TASK", "MARK_DONE":
+			s.WriteString(actionStyle.Render(fmt.Sprintf("Tarefa: %s", m.pendingAction.Title)) + "\n")
+		case "RENAME_TASK":
+			s.WriteString(actionStyle.Render(fmt.Sprintf("De:   %s", m.pendingAction.OldTitle)) + "\n")
+			s.WriteString(actionStyle.Render(fmt.Sprintf("Para: %s", m.pendingAction.NewTitle)) + "\n")
+		}
+	}
+
+	s.WriteString("\n" + lipgloss.NewStyle().Foreground(color).Render("  Deseja permitir esta ação no seu banco de dados?") + "\n")
+	s.WriteString(faintStyle.Render("  [y] Sim  [n] Não"))
+}
+
+type aiScanResponseMsg struct {
+	Content string
+	Err     error
+}
+
+type aiGlobalResponseMsg struct {
+	Content string
+	Err     error
+}
+
+func sendAIScanRequest(config ai.Config, msgs []ai.ChatMessage) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := ai.CallOpenAI(config.OpenAIAPIKey, config.OpenAIModel, msgs)
+		return aiScanResponseMsg{Content: resp, Err: err}
+	}
+}
+
+func sendAIGlobalRequest(config ai.Config, msgs []ai.ChatMessage) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := ai.CallOpenAI(config.OpenAIAPIKey, config.OpenAIModel, msgs)
+		return aiGlobalResponseMsg{Content: resp, Err: err}
+	}
 }
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────────

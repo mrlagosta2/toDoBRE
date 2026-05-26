@@ -94,11 +94,14 @@ The application uses intuitive **Vim-style** navigation alongside standard Arrow
 | **`c`** | Groups List | **Randomize / Reroll Color** for a Group |
 | **`t`** | Tasks List | Mark / Unmark Task for **Today** |
 | **`A`** | Tasks List | **AI Priority Recommendation** (which task to do first) |
+| **`S`** | Tasks List | **AI Task Scanner** (automatic suggestions for subtasks and renames) |
 | **`a`** | Task Details | Open **AI Agent Panel** (chat with AI about this task) |
+| **`C`** | Global | Open **Global AI Console (Omni-chat)** |
 | **`Shift+↑`** / **`K`** | Any | **Move Item Up** (Reorder) |
 | **`Shift+↓`** / **`J`** | Any | **Move Item Down** (Reorder) |
 | **`Space`** | Tasks / Subtasks | **Toggle Done / Undone** |
 | **`ctrl+x`** | Any | **Delete** Selected Item (or confirm deletion) |
+| **`u`** | Any | **Undo (Rollback)** the last destructive action (Delete/Reorder) |
 | **`Esc`** | Input / Detail / AI | **Cancel** Input / Return to previous view |
 | **`q`** | Global | **Quit** Application |
 
@@ -167,6 +170,16 @@ Pressing **`A`** while viewing any group's task list triggers an overlay modal w
 *   The AI evaluates completed vs. pending tasks, tasks marked for **Today**, title context, and description metadata.
 *   It returns a concise 5-6 line recommendation in Portuguese proposing exactly which task to tackle first and the reasoning behind it (considering urgency, value, and dependencies).
 
+### 🔍 AI Task Scanner (`S` from Tasks List)
+Pressing **`S`** opens a scanner modal that reviews all incomplete tasks in your current group. The AI automatically acts as a productivity optimizer, suggesting directly actionable name changes or identifying which tasks critically need to be broken down into subtasks to avoid procrastination.
+
+### 🌍 Global AI Console / Omni-chat (`C` from anywhere)
+Pressing **`C`** instantly pauses the app and drops you into a Global Omni-chat overlay. The AI knows the exact context of where you are (which workspace and group you have open) and can assist you globally. Future updates will allow this console to directly execute commands in the app (like auto-adding tasks or modifying configurations) based on JSON actions returned by the AI.
+
+### ↩️ Safety Rollback (`u`)
+With AI capable of making powerful changes (and users accidentally hitting delete on huge task trees), pressing `u` instantly rolls back the task list to its state immediately before the last destructive change (like deletions, AI auto-confirmations, or reordering).
+
+
 ---
 
 ## 🛠️ Built With
@@ -187,6 +200,9 @@ MIT License. Free to use and modify.
 
 ## 🐛 Changelog
 
+- **Feature**: Added AI Scanner (`S`) for automated productivity recommendations on task lists.
+- **Feature**: Added Global AI Console (`C`), an Omni-chat overlay that has global context of your workspaces.
+- **Feature**: Added `u` Undo (Rollback) system for instant restoration after destructive changes like deletions or reordering.
 - **Feature**: Added AI Agent integration with OpenAI GPT-4o-mini — chat panel (`a`), priority recommendations (`A`), subtask auto-creation, proactive task analysis, and persistent conversations per task.
 - **Fix**: Corrected a critical data loss bug on Windows where renaming a workspace or group (specially applying only case changes) caused the original file to be overridden and then deleted immediately.
 - **Fix**: Corrected a visual bug where completed tasks and subtasks became unreadable on certain terminal profiles by removing `Faint` styling and using a lighter gray color.

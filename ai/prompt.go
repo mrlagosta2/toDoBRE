@@ -1,6 +1,7 @@
 package ai
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -207,4 +208,55 @@ func IsConfirmation(input string) bool {
 		}
 	}
 	return false
+}
+
+// ParsedAction represents an action intended by the Omni-Console
+type ParsedAction struct {
+	Type     string `json:"-"`
+	Group    string `json:"group"`
+	Title    string `json:"title"`
+	OldTitle string `json:"old_title"`
+	NewTitle string `json:"new_title"`
+}
+
+// ParseAction extracts a JSON action block from the AI's Omni-Console response.
+// Returns nil if no action is found.
+func ParseAction(content string) *ParsedAction {
+	startTag := "[ACTION: "
+	startIdx := strings.Index(content, startTag)
+	if startIdx == -1 {
+		return nil
+	}
+
+	// Find the end of the action tag, e.g., "]"
+	tagEndIdx := strings.Index(content[startIdx:], "]")
+	if tagEndIdx == -1 {
+		return nil
+	}
+	tagEndIdx += startIdx
+
+	actionType := strings.TrimSpace(content[startIdx+len(startTag) : tagEndIdx])
+
+	// The JSON should be on the next lines, probably wrapped in ```json
+	jsonStart := strings.Index(content[tagEndIdx:], "{")
+	if jsonStart == -1 {
+		return nil
+	}
+	jsonStart += tagEndIdx
+
+	jsonEnd := strings.LastIndex(content[jsonStart:], "}")
+	if jsonEnd == -1 {
+		return nil
+	}
+	jsonEnd += jsonStart
+
+	jsonStr := content[jsonStart : jsonEnd+1]
+
+	var action ParsedAction
+	err := json.Unmarshal([]byte(jsonStr), &action)
+	if err != nil {
+		return nil
+	}
+	action.Type = actionType
+	return &action
 }
